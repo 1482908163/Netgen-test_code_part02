@@ -25,6 +25,7 @@ void DumpCurrentSurfaceElementsToFile(void *submesh, const std::string &filepath
 void DumpCurrentVolumeElementsToFile(void *submesh, const std::string &filepath);
 void DumpInitialPointsToPointTable(void *submesh, const std::string &path);
 void ReplayNewPointsFromPointTableToMesh(void *submesh, const std::string &point_table_path, int start_point_id);
+bool WriteVolFromStreams(const std::string &point_table_path, const std::string &surface_file, const std::string &tet_file, const std::string &out_vol_path);
 void Refineforvol_Stream(void *submesh, const std::string &surface_infile, const std::string &tet_infile, const std::string &surface_outfile, const std::string &tet_outfile, const std::string &point_table_path, std::size_t batch_faces, std::size_t batch_tets, int &next_point_id, std::size_t edge_shards, int round, std::map< Barycentric, int, CompBarycentric > &baryc2locvrtxmap, std::map<int, Barycentric> &locvrtx2barycmap, std::map < IntPair, int, IntPairCompare> &edgemap);
 void *ReplayTetsFromFileToMesh(void *submesh, const std::string &filepath, std::size_t batch_tets);
 void Refineforvol(void *submesh, int belongNumberPartition, std::list<xdFace> &newfaces, std::map< Barycentric, int, CompBarycentric > &baryc2locvrtxmap, std::map<int, Barycentric> &locvrtx2barycmap, std::map < IntPair, int, IntPairCompare> &edgemap);

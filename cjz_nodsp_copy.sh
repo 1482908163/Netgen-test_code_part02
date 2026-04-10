@@ -54,6 +54,7 @@ yhrun --mpi=pmix "$BIN_PATH" \
   --stream-batch 4096 \
   --stream-vol-batch 4096 \
   --keep-stream-files \
+  --stream-final-mode file_only \
   -v -adj
 
 end_time=$(date +%s)

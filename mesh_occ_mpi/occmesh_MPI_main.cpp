@@ -146,6 +146,7 @@ void print_help() {
          "--stream-batch : 表面流批大小 默认为4096" << endl <<
          "--stream-vol-batch : 体流批大小 默认为4096" << endl <<
          "--stream-dir : 流式中间文件目录 默认为 <output>/stream" << endl <<
+         "--stream-final-mode : 最终阶段模式 replay/file_only，默认为 replay" << endl <<
          "--keep-stream-files : 保留流式中间文件" << endl <<
          "-adj : 通信" << endl <<
          "-h --help : 参数输入帮助" << endl;
@@ -180,6 +181,7 @@ int main(int argc, char **argv) {
     std::size_t stream_batch = 4096;
     std::size_t stream_vol_batch = 4096;
     std::string stream_dir;
+    std::string stream_final_mode = "replay";
     bool keep_stream_files = false;
 //
 
@@ -275,6 +277,21 @@ int main(int argc, char **argv) {
                 return 1;
             }
         }
+        else if(!strcmp(argv[i],"--stream-final-mode")) {
+            if(argv[i+1] != NULL) {
+                stream_final_mode = argv[i+1];
+                if(stream_final_mode != "replay" && stream_final_mode != "file_only") {
+                    print_help();
+                    MPI_Finalize();
+                    return 1;
+                }
+            }
+            else {
+                print_help();
+                MPI_Finalize();
+                return 1;
+            }
+        }
         else if(!strcmp(argv[i],"--keep-stream-files")) {
             keep_stream_files = true;
         }
@@ -302,6 +319,7 @@ int main(int argc, char **argv) {
              "表面流批大小 : " << stream_batch << endl <<
              "体流批大小 : " << stream_vol_batch << endl <<
              "流文件目录 : " << stream_dir << endl <<
+             "最终阶段模式 : " << stream_final_mode << endl <<
              "网格最大值:" << maxh << endl <<
              "网格最小值:" << minh << endl;
 
@@ -527,7 +545,8 @@ int main(int argc, char **argv) {
         time[2] = double(currtime2 - currtime1);
         print_stage_mem("after PartFaceCreate", id);
 
-        if(!stream_mode) {
+	        bool skip_final_mesh_postprocess = false;
+	        if(!stream_mode) {
             Refine(submesh, numlevels, id, newfaces, baryc2locvrtxmap, locvrtx2barycmap, edgemap);
         }
         else {
@@ -566,7 +585,7 @@ int main(int argc, char **argv) {
                 Refineforvol(submesh, id, newfaces, baryc2locvrtxmap, locvrtx2barycmap, edgemap);
             }
         }
-        else if(numrefine > 0) {
+	        else if(numrefine > 0) {
             // 完整体流式路径：
             // 1. 从当前 submesh 导出 surface/tet stream；
             // 2. 每轮执行 stream -> stream 的体细化；
@@ -601,21 +620,41 @@ int main(int argc, char **argv) {
                 print_stage_mem("after one Refineforvol_Stream round", id);
 	            }
 
-	            collect_patbound_faces_from_surface_file(surface_in, stream_batch, patbound_faces);
-	            use_saved_patbound_faces = true;
-	            ReplayNewPointsFromPointTableToMesh(submesh, point_table_path, initial_np + 1);
-	            AddFacesFromFileToMesh(submesh, surface_in, stream_batch);
-	            submesh = (Ng_Mesh *)ReplayTetsFromFileToMesh(submesh, tet_in, stream_vol_batch);
-	            print_stage_mem("after ReplayTetsFromFileToMesh", id);
+		            print_stage_mem("before final replay/postprocess", id);
+		            if(stream_final_mode == "file_only") {
+		                if(id == 0) {
+		                    std::cout << "[STREAM] final mode=file_only, skip replay/postprocess" << std::endl;
+		                }
+		                if(save_vol) {
+		                    const std::string stream_vol_path = OUTPUT_PATH + "volfined/volfined" + str_id + ".vol";
+		                    if(!WriteVolFromStreams(point_table_path, surface_in, tet_in, stream_vol_path)) {
+		                        std::cerr << "failed to write .vol from streams: " << stream_vol_path << std::endl;
+		                        MPI_Abort(MPI_COMM_WORLD, 1);
+		                        return 1;
+		                    }
+		                }
+		                print_stage_mem("after final replay/postprocess", id);
+		                skip_final_mesh_postprocess = true;
+		            }
+		            else {
+		                collect_patbound_faces_from_surface_file(surface_in, stream_batch, patbound_faces);
+		                use_saved_patbound_faces = true;
+		                ReplayNewPointsFromPointTableToMesh(submesh, point_table_path, initial_np + 1);
+		                AddFacesFromFileToMesh(submesh, surface_in, stream_batch);
+		                submesh = (Ng_Mesh *)ReplayTetsFromFileToMesh(submesh, tet_in, stream_vol_batch);
+		                print_stage_mem("after ReplayTetsFromFileToMesh", id);
+		                print_stage_mem("after final replay/postprocess", id);
 
-	            if(!keep_stream_files) {
-	                std::filesystem::remove(surface_in);
-	                std::filesystem::remove(tet_in);
-	                std::filesystem::remove(point_table_path);
-	            }
-	        }
+		                if(!keep_stream_files) {
+		                    std::filesystem::remove(surface_in);
+		                    std::filesystem::remove(tet_in);
+		                    std::filesystem::remove(point_table_path);
+		                }
+		            }
+		        }
 
-        std::string savepvname = OUTPUT_PATH + "volfined/volfined" + str_id + ".vol";
+	        if(!skip_final_mesh_postprocess) {
+	        std::string savepvname = OUTPUT_PATH + "volfined/volfined" + str_id + ".vol";
 
         if(save_vol) {
             nglib::Ng_SaveMesh(submesh, savepvname.c_str());
@@ -928,12 +967,13 @@ int main(int argc, char **argv) {
         }
 
 
-        fclose(fp);
-        //}
-        meshQualityEvaluation(submesh, id, OUTPUT_PATH);
+	        fclose(fp);
+	        //}
+	        meshQualityEvaluation(submesh, id, OUTPUT_PATH);
+	        }
 
 
-    }
+	    }
 
     if(id == 0) cout << "successful!!!" << endl;
     MPI_Finalize();

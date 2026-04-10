@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <limits>
 #include <math.h>
 #include <iostream>
 #include <sstream>
@@ -61,6 +63,7 @@ static_assert(std::is_trivially_copyable<EdgeMidRecord>::value, "EdgeMidRecord m
 
 void FailStreamOperation(const std::string &message);
 void EnsureParentDirectory(const std::string &filepath);
+int GetPointRecordCount(const std::string &path);
 
 std::string g_point_table_stream_path;
 std::fstream g_point_table_stream;
@@ -146,6 +149,77 @@ void ReadPointRecord(const std::string &path, int point_id, double xyz[3])
 	xyz[0] = record.xyz[0];
 	xyz[1] = record.xyz[1];
 	xyz[2] = record.xyz[2];
+}
+
+void AppendPointRecordsBulk(const std::string &path, const std::vector<PointCoordRecord> &records)
+{
+	if (records.empty())
+	{
+		return;
+	}
+
+	std::fstream &stream = OpenPointTableStream(path);
+	stream.clear();
+	stream.seekp(0, std::ios::end);
+	stream.write(reinterpret_cast<const char *>(records.data()),
+		static_cast<std::streamsize>(records.size() * sizeof(PointCoordRecord)));
+	stream.flush();
+	if (!stream)
+	{
+		FailStreamOperation("failed to append point records to: " + path);
+	}
+}
+
+std::vector<PointCoordRecord> ReadPointRecordsByIds(const std::string &path,
+	const std::vector<int> &sorted_unique_point_ids)
+{
+	std::vector<PointCoordRecord> coords(sorted_unique_point_ids.size());
+	if (sorted_unique_point_ids.empty())
+	{
+		return coords;
+	}
+
+	const int point_count = GetPointRecordCount(path);
+	std::fstream &stream = OpenPointTableStream(path);
+	stream.flush();
+	for (std::size_t i = 0; i < sorted_unique_point_ids.size(); ++i)
+	{
+		const int point_id = sorted_unique_point_ids[i];
+		if (point_id < 1 || point_id > point_count)
+		{
+			FailStreamOperation("point id out of range for bulk point table lookup: " + std::to_string(point_id));
+		}
+		if (i > 0 && sorted_unique_point_ids[i - 1] >= point_id)
+		{
+			FailStreamOperation("point id cache request must be sorted and unique");
+		}
+		const std::uintmax_t offset = static_cast<std::uintmax_t>(point_id - 1) * sizeof(PointCoordRecord);
+		stream.clear();
+		stream.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+		stream.read(reinterpret_cast<char *>(&coords[i]), static_cast<std::streamsize>(sizeof(PointCoordRecord)));
+		if (!stream)
+		{
+			FailStreamOperation("failed to bulk-read point record from: " + path);
+		}
+	}
+	return coords;
+}
+
+const PointCoordRecord &LookupPointCoordInCache(const std::vector<int> &sorted_unique_point_ids,
+	const std::vector<PointCoordRecord> &coords,
+	int point_id)
+{
+	const auto it = std::lower_bound(sorted_unique_point_ids.begin(), sorted_unique_point_ids.end(), point_id);
+	if (it == sorted_unique_point_ids.end() || *it != point_id)
+	{
+		FailStreamOperation("missing point id in shard point cache: " + std::to_string(point_id));
+	}
+	const std::size_t index = static_cast<std::size_t>(it - sorted_unique_point_ids.begin());
+	if (index >= coords.size())
+	{
+		FailStreamOperation("point cache index out of range for point id: " + std::to_string(point_id));
+	}
+	return coords[index];
 }
 
 int GetPointRecordCount(const std::string &path)
@@ -602,31 +676,50 @@ std::vector<std::vector<EdgeMidRecord>> BuildEdgeMidShardTables(const std::vecto
 				return lhs.key < rhs.key;
 			});
 
-		std::vector<EdgeMidRecord> mid_records;
-		mid_records.reserve(all_requests.size());
-		for (std::size_t i = 0; i < all_requests.size();)
-		{
-			const EdgeReqRecord &request = all_requests[i];
-			double xyz0[3];
-			double xyz1[3];
-			double midpoint[3];
-			ReadPointRecord(point_table_path, request.v0, xyz0);
-			ReadPointRecord(point_table_path, request.v1, xyz1);
-			midpoint[0] = 0.5 * (xyz0[0] + xyz1[0]);
-			midpoint[1] = 0.5 * (xyz0[1] + xyz1[1]);
-			midpoint[2] = 0.5 * (xyz0[2] + xyz1[2]);
-			const int index = next_point_id++;
-			AppendPointRecord(point_table_path, midpoint);
-			mid_records.push_back(EdgeMidRecord{request.key, index});
-			++total_unique_internal_edges;
-
-			const EdgeKey current_key = request.key;
-			do
+			std::vector<EdgeReqRecord> unique_requests;
+			unique_requests.reserve(all_requests.size());
+			for (std::size_t i = 0; i < all_requests.size();)
 			{
-				++i;
+				unique_requests.push_back(all_requests[i]);
+				const EdgeKey current_key = all_requests[i].key;
+				do
+				{
+					++i;
+				}
+				while (i < all_requests.size() && all_requests[i].key == current_key);
 			}
-			while (i < all_requests.size() && all_requests[i].key == current_key);
-		}
+
+			std::vector<int> endpoint_ids;
+			endpoint_ids.reserve(unique_requests.size() * 2);
+			for (const EdgeReqRecord &request : unique_requests)
+			{
+				endpoint_ids.push_back(request.v0);
+				endpoint_ids.push_back(request.v1);
+			}
+			std::sort(endpoint_ids.begin(), endpoint_ids.end());
+			endpoint_ids.erase(std::unique(endpoint_ids.begin(), endpoint_ids.end()), endpoint_ids.end());
+
+			const std::vector<PointCoordRecord> endpoint_coords = ReadPointRecordsByIds(point_table_path, endpoint_ids);
+
+			std::vector<EdgeMidRecord> mid_records;
+			mid_records.reserve(unique_requests.size());
+			std::vector<PointCoordRecord> point_append_buffer;
+			point_append_buffer.reserve(unique_requests.size());
+			for (const EdgeReqRecord &request : unique_requests)
+			{
+				const PointCoordRecord &coord0 = LookupPointCoordInCache(endpoint_ids, endpoint_coords, request.v0);
+				const PointCoordRecord &coord1 = LookupPointCoordInCache(endpoint_ids, endpoint_coords, request.v1);
+				PointCoordRecord midpoint{};
+				midpoint.xyz[0] = 0.5 * (coord0.xyz[0] + coord1.xyz[0]);
+				midpoint.xyz[1] = 0.5 * (coord0.xyz[1] + coord1.xyz[1]);
+				midpoint.xyz[2] = 0.5 * (coord0.xyz[2] + coord1.xyz[2]);
+
+				const int index = next_point_id++;
+				mid_records.push_back(EdgeMidRecord{request.key, index});
+				point_append_buffer.push_back(midpoint);
+				++total_unique_internal_edges;
+			}
+			AppendPointRecordsBulk(point_table_path, point_append_buffer);
 
 		std::ofstream output(edge_mid_files[shard], std::ios::binary | std::ios::trunc);
 		if (!output)
@@ -1018,6 +1111,129 @@ void ReplayNewPointsFromPointTableToMesh(void *submesh, const std::string &point
 			FailStreamOperation("point renumbering changed while replaying point table");
 		}
 	}
+}
+
+bool WriteVolFromStreams(const std::string &point_table_path,
+	const std::string &surface_file,
+	const std::string &tet_file,
+	const std::string &out_vol_path)
+{
+	std::ifstream surface_input(surface_file, std::ios::binary);
+	if (!surface_input)
+	{
+		return false;
+	}
+	std::ifstream tet_input(tet_file, std::ios::binary);
+	if (!tet_input)
+	{
+		return false;
+	}
+	std::ifstream point_input(point_table_path, std::ios::binary);
+	if (!point_input)
+	{
+		return false;
+	}
+
+	EnsureParentDirectory(out_vol_path);
+	std::ofstream output(out_vol_path, std::ios::trunc);
+	if (!output)
+	{
+		return false;
+	}
+
+	std::vector<FaceRecord> face_buffer;
+	std::size_t surface_count = 0;
+	int max_geoboundary = 0;
+	while (ReadFaceBatch(surface_input, face_buffer, kDefaultStreamBatch) > 0)
+	{
+		surface_count += face_buffer.size();
+		for (const FaceRecord &record : face_buffer)
+		{
+			max_geoboundary = std::max(max_geoboundary, std::max(record.geoboundary, 1));
+		}
+	}
+	surface_input.clear();
+	surface_input.seekg(0, std::ios::beg);
+
+	std::vector<TetRecord> tet_buffer;
+	std::size_t tet_count = 0;
+	while (ReadTetBatch(tet_input, tet_buffer, kDefaultStreamBatch) > 0)
+	{
+		tet_count += tet_buffer.size();
+	}
+	tet_input.clear();
+	tet_input.seekg(0, std::ios::beg);
+
+	const int point_count = GetPointRecordCount(point_table_path);
+
+	output << "# Generated by NETGEN stream writer\n\n";
+	output << "mesh3d\n";
+	output << "dimension\n3\n";
+	output << "geomtype\n0\n\n";
+	output << "# surfnr\tdomin\tdomout\ttlosurf\tbcprop\n";
+	output << "facedescriptors\n";
+	output << max_geoboundary << "\n";
+	for (int descriptor = 1; descriptor <= max_geoboundary; ++descriptor)
+	{
+		output << descriptor << " 1 0 " << descriptor << " " << descriptor << "\n";
+	}
+
+	output << "surfaceelements\n";
+	output << surface_count << "\n";
+	while (ReadFaceBatch(surface_input, face_buffer, kDefaultStreamBatch) > 0)
+	{
+		for (const FaceRecord &record : face_buffer)
+		{
+			const int descriptor = std::max(record.geoboundary, 1);
+			output << " " << descriptor << " 1 1 0 3 "
+				<< record.lsvrtx[0] << " "
+				<< record.lsvrtx[1] << " "
+				<< record.lsvrtx[2] << "\n";
+		}
+	}
+
+	output << "volumeelements\n";
+	output << tet_count << "\n";
+	while (ReadTetBatch(tet_input, tet_buffer, kDefaultStreamBatch) > 0)
+	{
+		for (const TetRecord &record : tet_buffer)
+		{
+			output << record.domidx << " 4 "
+				<< record.vids[0] << " "
+				<< record.vids[1] << " "
+				<< record.vids[2] << " "
+				<< record.vids[3] << "\n";
+		}
+	}
+
+	output << "points\n";
+	output << point_count << "\n";
+	output << std::setprecision(std::numeric_limits<double>::max_digits10);
+	std::vector<PointCoordRecord> point_buffer(kDefaultStreamBatch);
+	while (true)
+	{
+		point_input.read(reinterpret_cast<char *>(point_buffer.data()),
+			static_cast<std::streamsize>(point_buffer.size() * sizeof(PointCoordRecord)));
+		const std::streamsize bytes_read = point_input.gcount();
+		if (bytes_read == 0)
+		{
+			break;
+		}
+		if (bytes_read < 0 || bytes_read % static_cast<std::streamsize>(sizeof(PointCoordRecord)) != 0)
+		{
+			FailStreamOperation("point table file is truncated while writing .vol: " + point_table_path);
+		}
+		const std::size_t count = static_cast<std::size_t>(bytes_read / static_cast<std::streamsize>(sizeof(PointCoordRecord)));
+		for (std::size_t i = 0; i < count; ++i)
+		{
+			output << point_buffer[i].xyz[0] << " "
+				<< point_buffer[i].xyz[1] << " "
+				<< point_buffer[i].xyz[2] << "\n";
+		}
+	}
+
+	output << "endmesh\n";
+	return static_cast<bool>(output);
 }
 
 nglib::Ng_Mesh *ClearVolumeElementsOrEquivalent(nglib::Ng_Mesh *mesh)
