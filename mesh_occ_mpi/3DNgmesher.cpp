@@ -6,6 +6,8 @@
 #include <fstream>
 #include <math.h>
 #include <iostream>
+#include <sstream>
+#include <sys/resource.h>
 #include "3DNgmesher.h"
 #include <string>
 #include <time.h>
@@ -183,6 +185,73 @@ std::size_t EffectiveBatch(std::size_t batch_size)
 {
 	// 用户没显式给 batch 时，统一回落到默认批大小。
 	return batch_size == 0 ? kDefaultStreamBatch : batch_size;
+}
+
+double GetCurrentRssMb()
+{
+	std::ifstream status("/proc/self/status");
+	std::string line;
+	while (std::getline(status, line))
+	{
+		if (line.rfind("VmRSS:", 0) == 0)
+		{
+			std::istringstream iss(line);
+			std::string key;
+			double rss_kb = 0.0;
+			std::string unit;
+			iss >> key >> rss_kb >> unit;
+			return rss_kb / 1024.0;
+		}
+	}
+	return 0.0;
+}
+
+double GetPeakRssMb()
+{
+	struct rusage usage {};
+	if (getrusage(RUSAGE_SELF, &usage) != 0)
+	{
+		return 0.0;
+	}
+	return usage.ru_maxrss / 1024.0;
+}
+
+bool IsPowerOfTwo(std::size_t value)
+{
+	return value != 0 && (value & (value - 1)) == 0;
+}
+
+void PrintInnerMemLog(const char *phase,
+	int round,
+	void *submesh,
+	const std::map<Barycentric, int, CompBarycentric> &baryc2locvrtxmap,
+	const std::map<int, Barycentric> &locvrtx2barycmap,
+	const std::map<IntPair, int, IntPairCompare> &edgemap,
+	const std::size_t *boundary_edges_size = nullptr,
+	const std::size_t *output_buffer_size = nullptr)
+{
+	int rank = -1;
+	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+	nglib::Ng_Mesh *mesh = (nglib::Ng_Mesh *)submesh;
+
+	std::cout << "[MEM-INNER] rank=" << rank
+		<< " round=" << round
+		<< " phase=" << phase
+		<< " current_rss=" << GetCurrentRssMb() << " MB"
+		<< " peak_rss=" << GetPeakRssMb() << " MB"
+		<< " np=" << nglib::Ng_GetNP(mesh)
+		<< " baryc2locvrtxmap.size=" << baryc2locvrtxmap.size()
+		<< " locvrtx2barycmap.size=" << locvrtx2barycmap.size()
+		<< " edgemap.size=" << edgemap.size();
+	if (boundary_edges_size != nullptr)
+	{
+		std::cout << " boundary_edges.size=" << *boundary_edges_size;
+	}
+	if (output_buffer_size != nullptr)
+	{
+		std::cout << " output_buffer.size=" << *output_buffer_size;
+	}
+	std::cout << std::endl;
 }
 
 std::size_t ReadFaceBatch(std::ifstream &input, std::vector<FaceRecord> &buffer, std::size_t batch_size)
@@ -1425,6 +1494,7 @@ void Refineforvol_Stream(void *submesh,
 	const std::string &tet_outfile,
 	std::size_t batch_faces,
 	std::size_t batch_tets,
+	int round,
 	std::map<Barycentric, int, CompBarycentric> &baryc2locvrtxmap,
 	std::map<int, Barycentric> &locvrtx2barycmap,
 	std::map<IntPair, int, IntPairCompare> &edgemap)
@@ -1445,75 +1515,103 @@ void Refineforvol_Stream(void *submesh,
 	//
 	// 这样就把“表面 -> 体细化”的桥梁从内存 newfaces 改成了
 	// “当前 submesh + 外存 stream + 双向 barycentric 映射”。
+	// 阶段1：打印初始内存日志并清理边映射表
+	PrintInnerMemLog("enter", round, submesh, baryc2locvrtxmap, locvrtx2barycmap, edgemap);
 	edgemap.clear();
 
+	// 阶段2：流式细分表面面网格，并收集当前边界边信息
 	std::set<IntPair, IntPairCompare> boundary_edges;
+	// 读取表面输入流进行面细分，将细分结果写入表面输出流，并输出边界边
 	StreamRefineFacesToFile(submesh, surface_infile, surface_outfile, batch_faces, baryc2locvrtxmap, locvrtx2barycmap, edgemap, &boundary_edges);
+	const std::size_t boundary_edges_size = boundary_edges.size();
+	// 打印完成表面细分后的内存日志
+	PrintInnerMemLog("after_surface", round, submesh, baryc2locvrtxmap, locvrtx2barycmap, edgemap, &boundary_edges_size, nullptr);
 
+	// 阶段3：准备四面体网格的输入和输出流
 	std::ifstream input(tet_infile, std::ios::binary);
 	if (!input)
 	{
 		FailStreamOperation("failed to open tet stream input file: " + tet_infile);
 	}
-	EnsureParentDirectory(tet_outfile);
+	EnsureParentDirectory(tet_outfile); //确保输出文件的父目录存在
 	std::ofstream output(tet_outfile, std::ios::binary | std::ios::trunc);
 	if (!output)
 	{
 		FailStreamOperation("failed to open tet stream output file: " + tet_outfile);
 	}
 
+	// 阶段4：初始化缓冲区，准备进行四面体网格的流式细分
 	std::vector<TetRecord> input_buffer;
 	std::vector<TetRecord> output_buffer;
-	output_buffer.reserve(EffectiveBatch(batch_tets) * 8);
+	output_buffer.reserve(EffectiveBatch(batch_tets) * 8); // 输出缓冲区预留空间（1个四面体分8个）
+	std::size_t batch_count = 0;
 
-	while (ReadTetBatch(input, input_buffer, batch_tets) > 0)
+	// 阶段5：按批次读取并细分四面体网格
+	while (ReadTetBatch(input, input_buffer, batch_tets) > 0) // 从输入流批量读取四面体记录
 	{
+		++batch_count;
 		for (const TetRecord &record : input_buffer)
 		{
 			int Ev[10] = {0};
 			int domainidx = 0;
-			FromTetRecord(record, Ev, domainidx);
+			FromTetRecord(record, Ev, domainidx); // 从记录中提取四面体顶点和所属域索引
 
+			// 处理四面体的6条边，生成或获取每一条边的中点
 			for (int edge = 0; edge < 6; ++edge)
 			{
 				const int va = Ev[kTetEdges[edge][0]];
 				const int vb = Ev[kTetEdges[edge][1]];
-				const IntPair ordered_edge = MakeOrderedEdge(va, vb);
+				const IntPair ordered_edge = MakeOrderedEdge(va, vb); // 创建一个有序的边对象（小顶点号在前）
 
+				// 检查边是否是边界边，如果是在边界上则需要使用重心坐标规则以保证共享边一致性
 				if (boundary_edges.find(ordered_edge) != boundary_edges.end())
 				{
 					Barycentric bary0{};
 					Barycentric bary1{};
+					// 从反向哈希表中获取顶点的重心坐标信息
 					if (!TryGetVertexBarycentric(va, locvrtx2barycmap, bary0) || !TryGetVertexBarycentric(vb, locvrtx2barycmap, bary1))
 					{
 						FailStreamOperation("missing boundary barycentric mapping while refining volume stream");
 					}
+					// 利用重心坐标为主获取或创建边的中点，并更新相关的映射表
 					Ev[edge + 4] = GetOrCreateEdgeMidpoint((nglib::Ng_Mesh *)submesh, va, vb, &bary0, &bary1, baryc2locvrtxmap, locvrtx2barycmap, edgemap, nullptr);
 				}
 				else
 				{
+					// 不在边界上的边，普通地获取或创建边中点（不依赖重心坐标对齐）
 					Ev[edge + 4] = GetOrCreateEdgeMidpoint((nglib::Ng_Mesh *)submesh, va, vb, nullptr, nullptr, baryc2locvrtxmap, locvrtx2barycmap, edgemap, nullptr);
 				}
 			}
 
+			// 将原四面体分割为8个新的子四面体，并存入输出缓冲区
 			for (int j = 0; j < 8; ++j)
 			{
 				int pointindex[4];
 				for (int k = 0; k < 4; ++k)
 				{
-					pointindex[k] = Ev[kTetRefTab[j][k]];
+					pointindex[k] = Ev[kTetRefTab[j][k]]; // 四面体细分引用表
 				}
-				output_buffer.push_back(ToTetRecord(pointindex, domainidx));
+				output_buffer.push_back(ToTetRecord(pointindex, domainidx)); // 打包四面体顶点和域索引为定长记录
 			}
 
+			// 如果输出缓冲区达到指定的容量，刷入到文件中
 			if (output_buffer.size() >= EffectiveBatch(batch_tets) * 8)
 			{
-				FlushTetBuffer(output, output_buffer);
+				FlushTetBuffer(output, output_buffer); // 将四面体缓冲批量写入磁盘
 			}
+		}
+
+		// 周期性地打印内存日志
+		if (IsPowerOfTwo(batch_count)) //判断是否为2的幂用来控制日志输出频率
+		{
+			const std::size_t output_buffer_size = output_buffer.size();
+			PrintInnerMemLog("tet_loop", round, submesh, baryc2locvrtxmap, locvrtx2barycmap, edgemap, nullptr, &output_buffer_size);
 		}
 	}
 
+	// 阶段6：将输出缓冲中剩余的结果刷入文件，并打印退出时的内存日志
 	FlushTetBuffer(output, output_buffer);
+	PrintInnerMemLog("exit", round, submesh, baryc2locvrtxmap, locvrtx2barycmap, edgemap);
 }
 
 void *ReplayTetsFromFileToMesh(void *submesh, const std::string &filepath, std::size_t batch_tets)

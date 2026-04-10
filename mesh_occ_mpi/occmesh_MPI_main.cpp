@@ -585,7 +585,7 @@ int main(int argc, char **argv) {
             print_stage_mem("after ClearVolumeElements", id);
 
             for (i = 0; i < numrefine; i++) {
-                Refineforvol_Stream(submesh, surface_in, tet_in, surface_out, tet_out, stream_batch, stream_vol_batch, baryc2locvrtxmap, locvrtx2barycmap, edgemap);
+                Refineforvol_Stream(submesh, surface_in, tet_in, surface_out, tet_out, stream_batch, stream_vol_batch, i + 1, baryc2locvrtxmap, locvrtx2barycmap, edgemap);
                 if(!keep_stream_files) {
                     std::filesystem::remove(surface_in);
                     std::filesystem::remove(tet_in);

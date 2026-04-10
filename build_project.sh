@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-PROJ_DIR=/vol8/home/hnu_lhz/cjz/NETGEN/test_code_part01
+PROJ_DIR=/vol8/home/hnu_lhz/cjz/NETGEN/test_code_part02
 BUILD_DIR=$PROJ_DIR/build
 GCCHOME=/vol8/home/hnu_lhz/cjz/gcc-12
 LOCAL_LIB=/vol8/home/hnu_lhz/cjz/lib/usr/lib/aarch64-linux-gnu

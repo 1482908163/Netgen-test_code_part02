@@ -17,7 +17,7 @@ export numlevels=1
 export numrefine=1
 export maxh=1000.0 
 export minh=0.0
-export input_path=/vol8/home/hnu_lhz/hjy/NETGEN/test_code_part01/inputData/$filename\.$fileformat
+export input_path=/vol8/home/hnu_lhz/hjy/NETGEN/test_code_part02/inputData/$filename\.$fileformat
 export output_path=/vol8/home/hnu_lhz/hjy/NETGEN/result/$filename\_r$numrefine\_l$numlevels\_$core_n\_max$maxh\_min$minh\/
 
 yhrun -p mt_test --mpi=pmix ./mesh_occ_mpi -i $input_path -o $output_path -l $numlevels -r $numrefine --maxh $maxh --minh $minh -v -adj
