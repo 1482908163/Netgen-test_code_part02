@@ -43,6 +43,125 @@ const int kTetRefTab[8][4] = {
 	{5, 7, 9, 8},
 };
 
+using EdgeKey = std::uint64_t;
+
+struct EdgeReqRecord {
+	EdgeKey key;
+	int v0;
+	int v1;
+};
+
+struct EdgeMidRecord {
+	EdgeKey key;
+	int mid;
+};
+
+static_assert(std::is_trivially_copyable<EdgeReqRecord>::value, "EdgeReqRecord must be trivially copyable");
+static_assert(std::is_trivially_copyable<EdgeMidRecord>::value, "EdgeMidRecord must be trivially copyable");
+
+void FailStreamOperation(const std::string &message);
+void EnsureParentDirectory(const std::string &filepath);
+
+std::string g_point_table_stream_path;
+std::fstream g_point_table_stream;
+
+void ResetPointTableStreamCache()
+{
+	if (g_point_table_stream.is_open())
+	{
+		g_point_table_stream.close();
+	}
+	g_point_table_stream.clear();
+	g_point_table_stream_path.clear();
+}
+
+std::fstream &OpenPointTableStream(const std::string &path)
+{
+	if (!g_point_table_stream.is_open() || g_point_table_stream_path != path)
+	{
+		ResetPointTableStreamCache();
+		EnsureParentDirectory(path);
+		g_point_table_stream.open(path, std::ios::binary | std::ios::in | std::ios::out);
+		if (!g_point_table_stream)
+		{
+			g_point_table_stream.clear();
+			std::ofstream create(path, std::ios::binary | std::ios::trunc);
+			if (!create)
+			{
+				FailStreamOperation("failed to create point table file: " + path);
+			}
+			create.close();
+			g_point_table_stream.open(path, std::ios::binary | std::ios::in | std::ios::out);
+		}
+		if (!g_point_table_stream)
+		{
+			FailStreamOperation("failed to open point table file: " + path);
+		}
+		g_point_table_stream_path = path;
+	}
+	return g_point_table_stream;
+}
+
+void AppendPointRecord(const std::string &path, const double xyz[3])
+{
+	PointCoordRecord record{};
+	record.xyz[0] = xyz[0];
+	record.xyz[1] = xyz[1];
+	record.xyz[2] = xyz[2];
+
+	std::fstream &stream = OpenPointTableStream(path);
+	stream.clear();
+	stream.seekp(0, std::ios::end);
+	stream.write(reinterpret_cast<const char *>(&record), static_cast<std::streamsize>(sizeof(PointCoordRecord)));
+	stream.flush();
+	if (!stream)
+	{
+		FailStreamOperation("failed to append point record to: " + path);
+	}
+}
+
+void ReadPointRecord(const std::string &path, int point_id, double xyz[3])
+{
+	if (point_id < 1)
+	{
+		FailStreamOperation("invalid point id for point table lookup: " + std::to_string(point_id));
+	}
+	const std::uintmax_t filesize = std::filesystem::exists(path) ? std::filesystem::file_size(path) : 0;
+	const std::uintmax_t offset = static_cast<std::uintmax_t>(point_id - 1) * sizeof(PointCoordRecord);
+	if (offset + sizeof(PointCoordRecord) > filesize)
+	{
+		FailStreamOperation("point id out of range for point table lookup: " + std::to_string(point_id));
+	}
+
+	PointCoordRecord record{};
+	std::fstream &stream = OpenPointTableStream(path);
+	stream.flush();
+	stream.clear();
+	stream.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+	stream.read(reinterpret_cast<char *>(&record), static_cast<std::streamsize>(sizeof(PointCoordRecord)));
+	if (!stream)
+	{
+		FailStreamOperation("failed to read point record from: " + path);
+	}
+	xyz[0] = record.xyz[0];
+	xyz[1] = record.xyz[1];
+	xyz[2] = record.xyz[2];
+}
+
+int GetPointRecordCount(const std::string &path)
+{
+	if (!std::filesystem::exists(path))
+	{
+		return 0;
+	}
+	const std::uintmax_t filesize = std::filesystem::file_size(path);
+	if (filesize % sizeof(PointCoordRecord) != 0)
+	{
+		FailStreamOperation("point table file is truncated: " + path);
+	}
+	return static_cast<int>(filesize / sizeof(PointCoordRecord));
+}
+
 void FailStreamOperation(const std::string &message)
 {
 	std::cerr << message << std::endl;
@@ -228,7 +347,8 @@ void PrintInnerMemLog(const char *phase,
 	const std::map<int, Barycentric> &locvrtx2barycmap,
 	const std::map<IntPair, int, IntPairCompare> &edgemap,
 	const std::size_t *boundary_edges_size = nullptr,
-	const std::size_t *output_buffer_size = nullptr)
+	const std::size_t *output_buffer_size = nullptr,
+	const std::size_t *total_unique_internal_edges = nullptr)
 {
 	int rank = -1;
 	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -250,6 +370,10 @@ void PrintInnerMemLog(const char *phase,
 	if (output_buffer_size != nullptr)
 	{
 		std::cout << " output_buffer.size=" << *output_buffer_size;
+	}
+	if (total_unique_internal_edges != nullptr)
+	{
+		std::cout << " total_unique_internal_edges=" << *total_unique_internal_edges;
 	}
 	std::cout << std::endl;
 }
@@ -284,6 +408,238 @@ std::size_t ReadTetBatch(std::ifstream &input, std::vector<TetRecord> &buffer, s
 	return count;
 }
 
+EdgeKey PackEdgeKey(int a, int b)
+{
+	const IntPair ordered = MakeOrderedEdge(a, b);
+	return (static_cast<EdgeKey>(static_cast<std::uint32_t>(ordered.x)) << 32) |
+		static_cast<std::uint32_t>(ordered.y);
+}
+
+std::size_t EdgeShardIndex(EdgeKey key, std::size_t num_shards)
+{
+	return num_shards == 0 ? 0 : static_cast<std::size_t>(key % num_shards);
+}
+
+void WriteEdgeReq(std::ofstream &output, std::vector<EdgeReqRecord> &buffer)
+{
+	if (buffer.empty())
+	{
+		return;
+	}
+	output.write(reinterpret_cast<const char *>(buffer.data()), static_cast<std::streamsize>(buffer.size() * sizeof(EdgeReqRecord)));
+	if (!output)
+	{
+		FailStreamOperation("failed to write edge request shard file");
+	}
+	buffer.clear();
+}
+
+std::size_t ReadEdgeReqBatch(std::ifstream &input, std::vector<EdgeReqRecord> &buffer, std::size_t batch_records)
+{
+	buffer.resize(EffectiveBatch(batch_records));
+	input.read(reinterpret_cast<char *>(buffer.data()), static_cast<std::streamsize>(buffer.size() * sizeof(EdgeReqRecord)));
+	const std::streamsize bytes_read = input.gcount();
+	if (bytes_read < 0 || bytes_read % static_cast<std::streamsize>(sizeof(EdgeReqRecord)) != 0)
+	{
+		FailStreamOperation("edge request shard file is truncated");
+	}
+	const std::size_t count = static_cast<std::size_t>(bytes_read / static_cast<std::streamsize>(sizeof(EdgeReqRecord)));
+	buffer.resize(count);
+	return count;
+}
+
+void WriteEdgeMidRecords(std::ofstream &output, const std::vector<EdgeMidRecord> &records)
+{
+	if (records.empty())
+	{
+		return;
+	}
+	output.write(reinterpret_cast<const char *>(records.data()), static_cast<std::streamsize>(records.size() * sizeof(EdgeMidRecord)));
+	if (!output)
+	{
+		FailStreamOperation("failed to write edge midpoint shard file");
+	}
+}
+
+std::size_t ReadEdgeMidRecords(std::ifstream &input, std::vector<EdgeMidRecord> &buffer, std::size_t batch_records)
+{
+	buffer.resize(EffectiveBatch(batch_records));
+	input.read(reinterpret_cast<char *>(buffer.data()), static_cast<std::streamsize>(buffer.size() * sizeof(EdgeMidRecord)));
+	const std::streamsize bytes_read = input.gcount();
+	if (bytes_read < 0 || bytes_read % static_cast<std::streamsize>(sizeof(EdgeMidRecord)) != 0)
+	{
+		FailStreamOperation("edge midpoint shard file is truncated");
+	}
+	const std::size_t count = static_cast<std::size_t>(bytes_read / static_cast<std::streamsize>(sizeof(EdgeMidRecord)));
+	buffer.resize(count);
+	return count;
+}
+
+int LookupMidpointInShardVector(const std::vector<EdgeMidRecord> &records, EdgeKey key)
+{
+	const auto it = std::lower_bound(records.begin(), records.end(), key,
+		[](const EdgeMidRecord &record, EdgeKey target) {
+			return record.key < target;
+		});
+	if (it == records.end() || it->key != key)
+	{
+		FailStreamOperation("missing internal edge midpoint for shard key " + std::to_string(key));
+	}
+	return it->mid;
+}
+
+std::vector<std::string> BuildEdgeShardFilePaths(const std::string &tet_outfile,
+	const char *prefix,
+	int round,
+	std::size_t num_shards)
+{
+	int rank = -1;
+	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+	std::vector<std::string> paths(num_shards);
+	const std::filesystem::path parent_dir = std::filesystem::path(tet_outfile).parent_path();
+	for (std::size_t shard = 0; shard < num_shards; ++shard)
+	{
+		const std::filesystem::path filepath = parent_dir /
+			(std::string(prefix) + "_rank" + std::to_string(rank) + "_round" + std::to_string(round) + "_shard" + std::to_string(shard) + ".bin");
+		paths[shard] = filepath.string();
+	}
+	return paths;
+}
+
+std::vector<std::string> BuildInteriorEdgeShardFiles(const std::string &tet_infile,
+	const std::string &tet_outfile,
+	const std::set<IntPair, IntPairCompare> &boundary_edges,
+	std::size_t batch_tets,
+	int round,
+	std::size_t num_shards)
+{
+	const std::vector<std::string> shard_files = BuildEdgeShardFilePaths(tet_outfile, "edge_req", round, num_shards);
+	std::vector<std::ofstream> outputs(num_shards);
+	std::vector<std::vector<EdgeReqRecord>> buffers(num_shards);
+	for (std::size_t shard = 0; shard < num_shards; ++shard)
+	{
+		EnsureParentDirectory(shard_files[shard]);
+		outputs[shard].open(shard_files[shard], std::ios::binary | std::ios::trunc);
+		if (!outputs[shard])
+		{
+			FailStreamOperation("failed to open edge request shard file: " + shard_files[shard]);
+		}
+		buffers[shard].reserve(kDefaultStreamBatch);
+	}
+
+	std::ifstream input(tet_infile, std::ios::binary);
+	if (!input)
+	{
+		FailStreamOperation("failed to open tet stream input file for edge sharding: " + tet_infile);
+	}
+
+	std::vector<TetRecord> input_buffer;
+	const std::size_t edge_batch = EffectiveBatch(batch_tets) * 6;
+	while (ReadTetBatch(input, input_buffer, batch_tets) > 0)
+	{
+		for (const TetRecord &record : input_buffer)
+		{
+			int vids[4];
+			int domidx = 0;
+			FromTetRecord(record, vids, domidx);
+			(void)domidx;
+			for (int edge = 0; edge < 6; ++edge)
+			{
+				const int va = vids[kTetEdges[edge][0]];
+				const int vb = vids[kTetEdges[edge][1]];
+				const IntPair ordered_edge = MakeOrderedEdge(va, vb);
+				if (boundary_edges.find(ordered_edge) != boundary_edges.end())
+				{
+					continue;
+				}
+				const EdgeKey key = PackEdgeKey(ordered_edge.x, ordered_edge.y);
+				const std::size_t shard = EdgeShardIndex(key, num_shards);
+				buffers[shard].push_back(EdgeReqRecord{key, ordered_edge.x, ordered_edge.y});
+				if (buffers[shard].size() >= edge_batch)
+				{
+					WriteEdgeReq(outputs[shard], buffers[shard]);
+				}
+			}
+		}
+	}
+
+	for (std::size_t shard = 0; shard < num_shards; ++shard)
+	{
+		WriteEdgeReq(outputs[shard], buffers[shard]);
+	}
+	return shard_files;
+}
+
+std::vector<std::vector<EdgeMidRecord>> BuildEdgeMidShardTables(const std::vector<std::string> &edge_req_files,
+	const std::vector<std::string> &edge_mid_files,
+	const std::string &point_table_path,
+	std::size_t batch_tets,
+	int &next_point_id,
+	std::size_t &total_unique_internal_edges)
+{
+	std::vector<std::vector<EdgeMidRecord>> shard_mid_tables(edge_req_files.size());
+	total_unique_internal_edges = 0;
+
+	for (std::size_t shard = 0; shard < edge_req_files.size(); ++shard)
+	{
+		std::ifstream input(edge_req_files[shard], std::ios::binary);
+		if (!input)
+		{
+			FailStreamOperation("failed to open edge request shard file: " + edge_req_files[shard]);
+		}
+
+		std::vector<EdgeReqRecord> req_buffer;
+		std::vector<EdgeReqRecord> all_requests;
+		const std::size_t edge_batch = EffectiveBatch(batch_tets) * 6;
+		while (ReadEdgeReqBatch(input, req_buffer, edge_batch) > 0)
+		{
+			all_requests.insert(all_requests.end(), req_buffer.begin(), req_buffer.end());
+		}
+
+		std::sort(all_requests.begin(), all_requests.end(),
+			[](const EdgeReqRecord &lhs, const EdgeReqRecord &rhs) {
+				return lhs.key < rhs.key;
+			});
+
+		std::vector<EdgeMidRecord> mid_records;
+		mid_records.reserve(all_requests.size());
+		for (std::size_t i = 0; i < all_requests.size();)
+		{
+			const EdgeReqRecord &request = all_requests[i];
+			double xyz0[3];
+			double xyz1[3];
+			double midpoint[3];
+			ReadPointRecord(point_table_path, request.v0, xyz0);
+			ReadPointRecord(point_table_path, request.v1, xyz1);
+			midpoint[0] = 0.5 * (xyz0[0] + xyz1[0]);
+			midpoint[1] = 0.5 * (xyz0[1] + xyz1[1]);
+			midpoint[2] = 0.5 * (xyz0[2] + xyz1[2]);
+			const int index = next_point_id++;
+			AppendPointRecord(point_table_path, midpoint);
+			mid_records.push_back(EdgeMidRecord{request.key, index});
+			++total_unique_internal_edges;
+
+			const EdgeKey current_key = request.key;
+			do
+			{
+				++i;
+			}
+			while (i < all_requests.size() && all_requests[i].key == current_key);
+		}
+
+		std::ofstream output(edge_mid_files[shard], std::ios::binary | std::ios::trunc);
+		if (!output)
+		{
+			FailStreamOperation("failed to open edge midpoint shard file: " + edge_mid_files[shard]);
+		}
+		WriteEdgeMidRecords(output, mid_records);
+		shard_mid_tables[shard] = std::move(mid_records);
+	}
+
+	return shard_mid_tables;
+}
+
 bool TryGetVertexBarycentric(int vertex_id, const std::map<int, Barycentric> &locvrtx2barycmap, Barycentric &bary)
 {
 	// 反向查找：从 submesh 本地点号拿回 barycentric。
@@ -305,14 +661,17 @@ int GetOrCreateEdgeMidpoint(nglib::Ng_Mesh *submesh,
 	std::map<Barycentric, int, CompBarycentric> &baryc2locvrtxmap,
 	std::map<int, Barycentric> &locvrtx2barycmap,
 	std::map<IntPair, int, IntPairCompare> &edgemap,
-	Barycentric *midpoint_bary)
+	Barycentric *midpoint_bary,
+	const std::string &point_table_path,
+	int &next_point_id,
+	bool materialize_to_submesh)
 {
 	// 统一的“边中点获取/创建”入口，surface refine 和 volume refine 都走这里。
 	//
 	// 规则：
 	// 1. 如果这条边对应的 barycentric 中点已存在，以 baryc2locvrtxmap 为准直接复用；
 	// 2. 否则再看当前轮 edgemap 是否已有缓存；
-	// 3. 两者都没有才真正调用 Ng_AddPoint 新建点。
+	// 3. 两者都没有才真正创建新的中点。
 	//
 	// 这样可以同时保证：
 	// - shared boundary / interface 上中点不重复；
@@ -320,10 +679,11 @@ int GetOrCreateEdgeMidpoint(nglib::Ng_Mesh *submesh,
 	// - 所有新点都同步维护双向 barycentric 映射。
 	const IntPair pr = MakeOrderedEdge(v0, v1);
 	const bool has_bary = bary0 != nullptr && bary1 != nullptr;
-	const int np = nglib::Ng_GetNP(submesh);
-	if (v0 < 1 || v0 > np || v1 < 1 || v1 > np)
+	const int point_limit = materialize_to_submesh ? nglib::Ng_GetNP(submesh) : (next_point_id - 1);
+	if (v0 < 1 || v0 > point_limit || v1 < 1 || v1 > point_limit)
 	{
-		std::fprintf(stderr, "Invalid local edge vertex id: v0=%d v1=%d np=%d mesh=%p\n", v0, v1, np, (void *)submesh);
+		std::fprintf(stderr, "Invalid local edge vertex id: v0=%d v1=%d point_limit=%d mesh=%p materialize=%d\n",
+			v0, v1, point_limit, (void *)submesh, materialize_to_submesh ? 1 : 0);
 		if (has_bary)
 		{
 			std::fprintf(stderr,
@@ -360,14 +720,30 @@ int GetOrCreateEdgeMidpoint(nglib::Ng_Mesh *submesh,
 	double xyz0[3];
 	double xyz1[3];
 	double midpoint[3];
-	nglib::Ng_GetPoint(submesh, v0, xyz0);
-	nglib::Ng_GetPoint(submesh, v1, xyz1);
+	if (materialize_to_submesh)
+	{
+		nglib::Ng_GetPoint(submesh, v0, xyz0);
+		nglib::Ng_GetPoint(submesh, v1, xyz1);
+	}
+	else
+	{
+		ReadPointRecord(point_table_path, v0, xyz0);
+		ReadPointRecord(point_table_path, v1, xyz1);
+	}
 	midpoint[0] = 0.5 * (xyz0[0] + xyz1[0]);
 	midpoint[1] = 0.5 * (xyz0[1] + xyz1[1]);
 	midpoint[2] = 0.5 * (xyz0[2] + xyz1[2]);
 
 	int index = -1;
-	nglib::Ng_AddPoint(submesh, midpoint, index);
+	if (materialize_to_submesh)
+	{
+		nglib::Ng_AddPoint(submesh, midpoint, index);
+	}
+	else
+	{
+		index = next_point_id++;
+		AppendPointRecord(point_table_path, midpoint);
+	}
 	edgemap[pr] = index;
 
 	if (has_bary)
@@ -377,13 +753,41 @@ int GetOrCreateEdgeMidpoint(nglib::Ng_Mesh *submesh,
 	return index;
 }
 
-void RefineFaceAndCollectChildren(nglib::Ng_Mesh *submesh,
+int GetOrCreateEdgeMidpoint(nglib::Ng_Mesh *submesh,
+	int v0,
+	int v1,
+	const Barycentric *bary0,
+	const Barycentric *bary1,
+	std::map<Barycentric, int, CompBarycentric> &baryc2locvrtxmap,
+	std::map<int, Barycentric> &locvrtx2barycmap,
+	std::map<IntPair, int, IntPairCompare> &edgemap,
+	Barycentric *midpoint_bary)
+{
+	int next_point_id = nglib::Ng_GetNP(submesh) + 1;
+	return GetOrCreateEdgeMidpoint(submesh,
+		v0,
+		v1,
+		bary0,
+		bary1,
+		baryc2locvrtxmap,
+		locvrtx2barycmap,
+		edgemap,
+		midpoint_bary,
+		std::string(),
+		next_point_id,
+		true);
+	}
+
+	void RefineFaceAndCollectChildren(nglib::Ng_Mesh *submesh,
 	const xdFace &face,
 	std::vector<xdFace> &children,
 	std::map<Barycentric, int, CompBarycentric> &baryc2locvrtxmap,
 	std::map<int, Barycentric> &locvrtx2barycmap,
 	std::map<IntPair, int, IntPairCompare> &edgemap,
-	std::set<IntPair, IntPairCompare> *boundary_edges)
+	std::set<IntPair, IntPairCompare> *boundary_edges,
+	const std::string &point_table_path,
+	int &next_point_id,
+	bool materialize_to_submesh)
 {
 	// 把一个三角面细分成 4 个子三角形，并返回子面列表。
 	// 这是原 Refine()/Refineforvol() 的公共细分逻辑，stream/non-stream 两条路径共用。
@@ -394,7 +798,7 @@ void RefineFaceAndCollectChildren(nglib::Ng_Mesh *submesh,
 	int u[3];
 	Barycentric vbarycv[3];
 	Barycentric ubarycv[3];
-	const int np = nglib::Ng_GetNP(submesh);
+	const int point_limit = materialize_to_submesh ? nglib::Ng_GetNP(submesh) : (next_point_id - 1);
 
 	for (int k = 0; k < 3; ++k)
 	{
@@ -402,11 +806,11 @@ void RefineFaceAndCollectChildren(nglib::Ng_Mesh *submesh,
 		// 这里不能边初始化边读下一点，否则会出现读取未初始化顶点的错误。
 		v[k] = face.lsvrtx[k];
 		vbarycv[k] = face.barycv[k];
-		if (v[k] < 1 || v[k] > np)
-		{
-			std::fprintf(stderr,
-				"Invalid face vertex id before refine: v[%d]=%d np=%d face=(%d,%d,%d) geoboundary=%d\n",
-				k, v[k], np, face.lsvrtx[0], face.lsvrtx[1], face.lsvrtx[2], face.geoboundary);
+			if (v[k] < 1 || v[k] > point_limit)
+			{
+				std::fprintf(stderr,
+					"Invalid face vertex id before refine: v[%d]=%d point_limit=%d face=(%d,%d,%d) geoboundary=%d materialize=%d\n",
+					k, v[k], point_limit, face.lsvrtx[0], face.lsvrtx[1], face.lsvrtx[2], face.geoboundary, materialize_to_submesh ? 1 : 0);
 			std::abort();
 		}
 	}
@@ -426,7 +830,10 @@ void RefineFaceAndCollectChildren(nglib::Ng_Mesh *submesh,
 			baryc2locvrtxmap,
 			locvrtx2barycmap,
 			edgemap,
-			&ubarycv[k]);
+			&ubarycv[k],
+			point_table_path,
+			next_point_id,
+			materialize_to_submesh);
 	}
 
 	children.clear();
@@ -459,14 +866,38 @@ void RefineFaceAndCollectChildren(nglib::Ng_Mesh *submesh,
 	children[3] = center;
 }
 
-void StreamRefineFacesToFile(void *submesh,
+void RefineFaceAndCollectChildren(nglib::Ng_Mesh *submesh,
+	const xdFace &face,
+	std::vector<xdFace> &children,
+	std::map<Barycentric, int, CompBarycentric> &baryc2locvrtxmap,
+	std::map<int, Barycentric> &locvrtx2barycmap,
+	std::map<IntPair, int, IntPairCompare> &edgemap,
+	std::set<IntPair, IntPairCompare> *boundary_edges)
+{
+	int next_point_id = nglib::Ng_GetNP(submesh) + 1;
+	RefineFaceAndCollectChildren(submesh,
+		face,
+		children,
+		baryc2locvrtxmap,
+		locvrtx2barycmap,
+		edgemap,
+		boundary_edges,
+		std::string(),
+		next_point_id,
+		true);
+	}
+
+	void StreamRefineFacesToFile(void *submesh,
 	const std::string &infile,
 	const std::string &outfile,
 	std::size_t batch_faces,
 	std::map<Barycentric, int, CompBarycentric> &baryc2locvrtxmap,
 	std::map<int, Barycentric> &locvrtx2barycmap,
 	std::map<IntPair, int, IntPairCompare> &edgemap,
-	std::set<IntPair, IntPairCompare> *boundary_edges)
+	std::set<IntPair, IntPairCompare> *boundary_edges,
+	const std::string &point_table_path,
+	int &next_point_id,
+	bool materialize_to_submesh)
 {
 	// surface stream 的核心批处理函数：
 	// 从 infile 按批读 FaceRecord -> 还原为 xdFace -> 细分为 4 个子三角 ->
@@ -497,7 +928,16 @@ void StreamRefineFacesToFile(void *submesh,
 		for (const FaceRecord &record : input_buffer)
 		{
 			const xdFace face = FromFaceRecord(record);
-			RefineFaceAndCollectChildren((nglib::Ng_Mesh *)submesh, face, children, baryc2locvrtxmap, locvrtx2barycmap, edgemap, boundary_edges);
+				RefineFaceAndCollectChildren((nglib::Ng_Mesh *)submesh,
+					face,
+					children,
+					baryc2locvrtxmap,
+					locvrtx2barycmap,
+					edgemap,
+					boundary_edges,
+					point_table_path,
+					next_point_id,
+					materialize_to_submesh);
 			for (const xdFace &child : children)
 			{
 				output_buffer.push_back(ToFaceRecord(child));
@@ -512,7 +952,73 @@ void StreamRefineFacesToFile(void *submesh,
 	FlushFaceBuffer(output, output_buffer);
 }
 
+void StreamRefineFacesToFile(void *submesh,
+	const std::string &infile,
+	const std::string &outfile,
+	std::size_t batch_faces,
+	std::map<Barycentric, int, CompBarycentric> &baryc2locvrtxmap,
+	std::map<int, Barycentric> &locvrtx2barycmap,
+	std::map<IntPair, int, IntPairCompare> &edgemap,
+	std::set<IntPair, IntPairCompare> *boundary_edges)
+{
+	int next_point_id = nglib::Ng_GetNP((nglib::Ng_Mesh *)submesh) + 1;
+	StreamRefineFacesToFile(submesh,
+		infile,
+		outfile,
+		batch_faces,
+		baryc2locvrtxmap,
+		locvrtx2barycmap,
+		edgemap,
+		boundary_edges,
+		std::string(),
+		next_point_id,
+		true);
+}
+
 } // namespace
+
+void DumpInitialPointsToPointTable(void *submesh, const std::string &path)
+{
+	ResetPointTableStreamCache();
+	EnsureParentDirectory(path);
+	std::ofstream output(path, std::ios::binary | std::ios::trunc);
+	if (!output)
+	{
+		FailStreamOperation("failed to open point table file for initial dump: " + path);
+	}
+
+	nglib::Ng_Mesh *mesh = (nglib::Ng_Mesh *)submesh;
+	const int np = nglib::Ng_GetNP(mesh);
+	for (int point_id = 1; point_id <= np; ++point_id)
+	{
+		PointCoordRecord record{};
+		nglib::Ng_GetPoint(mesh, point_id, record.xyz);
+		output.write(reinterpret_cast<const char *>(&record), static_cast<std::streamsize>(sizeof(PointCoordRecord)));
+		if (!output)
+		{
+			FailStreamOperation("failed while dumping initial points to point table: " + path);
+		}
+	}
+	output.close();
+	ResetPointTableStreamCache();
+}
+
+void ReplayNewPointsFromPointTableToMesh(void *submesh, const std::string &point_table_path, int start_point_id)
+{
+	const int total_points = GetPointRecordCount(point_table_path);
+	nglib::Ng_Mesh *mesh = (nglib::Ng_Mesh *)submesh;
+	for (int point_id = start_point_id; point_id <= total_points; ++point_id)
+	{
+		double xyz[3];
+		int index = -1;
+		ReadPointRecord(point_table_path, point_id, xyz);
+		nglib::Ng_AddPoint(mesh, xyz, index);
+		if (index != point_id)
+		{
+			FailStreamOperation("point renumbering changed while replaying point table");
+		}
+	}
+}
 
 nglib::Ng_Mesh *ClearVolumeElementsOrEquivalent(nglib::Ng_Mesh *mesh)
 {
@@ -1492,8 +1998,11 @@ void Refineforvol_Stream(void *submesh,
 	const std::string &tet_infile,
 	const std::string &surface_outfile,
 	const std::string &tet_outfile,
+	const std::string &point_table_path,
 	std::size_t batch_faces,
 	std::size_t batch_tets,
+	int &next_point_id,
+	std::size_t edge_shards,
 	int round,
 	std::map<Barycentric, int, CompBarycentric> &baryc2locvrtxmap,
 	std::map<int, Barycentric> &locvrtx2barycmap,
@@ -1509,109 +2018,151 @@ void Refineforvol_Stream(void *submesh,
 	//
 	// 执行顺序：
 	// 1. 先细分 surface_infile，得到下一轮 surface_outfile，同时收集当前边界边；
-	// 2. 再按批读取 tet_infile，对四面体沿用原 8-tet 细分规则；
-	// 3. 对边界边优先走 barycentric 中点规则，确保共享边中点一致；
-	// 4. 输出下一轮 tet_outfile。
+	// 2. 再按内部边 shard 收集 edge request；
+	// 3. 逐 shard 去重并一次性创建内部边中点；
+	// 4. 最后第二遍读取 tet_infile，输出下一轮 tet_outfile。
 	//
 	// 这样就把“表面 -> 体细化”的桥梁从内存 newfaces 改成了
 	// “当前 submesh + 外存 stream + 双向 barycentric 映射”。
-	// 阶段1：打印初始内存日志并清理边映射表
+	const std::size_t shard_count = edge_shards == 0 ? 16 : edge_shards;
+	std::size_t total_unique_internal_edges = 0;
+
+	// 阶段1：surface refine 保持原样
 	PrintInnerMemLog("enter", round, submesh, baryc2locvrtxmap, locvrtx2barycmap, edgemap);
 	edgemap.clear();
 
-	// 阶段2：流式细分表面面网格，并收集当前边界边信息
 	std::set<IntPair, IntPairCompare> boundary_edges;
-	// 读取表面输入流进行面细分，将细分结果写入表面输出流，并输出边界边
-	StreamRefineFacesToFile(submesh, surface_infile, surface_outfile, batch_faces, baryc2locvrtxmap, locvrtx2barycmap, edgemap, &boundary_edges);
+	StreamRefineFacesToFile(submesh,
+		surface_infile,
+		surface_outfile,
+		batch_faces,
+		baryc2locvrtxmap,
+		locvrtx2barycmap,
+		edgemap,
+		&boundary_edges,
+		point_table_path,
+		next_point_id,
+		false);
 	const std::size_t boundary_edges_size = boundary_edges.size();
-	// 打印完成表面细分后的内存日志
 	PrintInnerMemLog("after_surface", round, submesh, baryc2locvrtxmap, locvrtx2barycmap, edgemap, &boundary_edges_size, nullptr);
 
-	// 阶段3：准备四面体网格的输入和输出流
+	// 阶段2：按 shard 收集内部边请求
+	const std::vector<std::string> edge_req_files = BuildInteriorEdgeShardFiles(
+		tet_infile,
+		tet_outfile,
+		boundary_edges,
+		batch_tets,
+		round,
+		shard_count);
+	PrintInnerMemLog("after_edge_req_shards", round, submesh, baryc2locvrtxmap, locvrtx2barycmap, edgemap, nullptr, nullptr, &total_unique_internal_edges);
+
+	// 阶段3：逐 shard 去重并创建内部边中点
+	const std::vector<std::string> edge_mid_files = BuildEdgeShardFilePaths(tet_outfile, "edge_mid", round, shard_count);
+	const std::vector<std::vector<EdgeMidRecord>> edge_mid_shards = BuildEdgeMidShardTables(
+		edge_req_files,
+		edge_mid_files,
+		point_table_path,
+		batch_tets,
+		next_point_id,
+		total_unique_internal_edges);
+	PrintInnerMemLog("after_edge_mid_shards", round, submesh, baryc2locvrtxmap, locvrtx2barycmap, edgemap, nullptr, nullptr, &total_unique_internal_edges);
+
+	// 阶段4：第二遍读取 tet_infile，输出 refined tets
 	std::ifstream input(tet_infile, std::ios::binary);
 	if (!input)
 	{
 		FailStreamOperation("failed to open tet stream input file: " + tet_infile);
 	}
-	EnsureParentDirectory(tet_outfile); //确保输出文件的父目录存在
+	EnsureParentDirectory(tet_outfile);
 	std::ofstream output(tet_outfile, std::ios::binary | std::ios::trunc);
 	if (!output)
 	{
 		FailStreamOperation("failed to open tet stream output file: " + tet_outfile);
 	}
 
-	// 阶段4：初始化缓冲区，准备进行四面体网格的流式细分
 	std::vector<TetRecord> input_buffer;
 	std::vector<TetRecord> output_buffer;
-	output_buffer.reserve(EffectiveBatch(batch_tets) * 8); // 输出缓冲区预留空间（1个四面体分8个）
+	output_buffer.reserve(EffectiveBatch(batch_tets) * 8);
 	std::size_t batch_count = 0;
 
-	// 阶段5：按批次读取并细分四面体网格
-	while (ReadTetBatch(input, input_buffer, batch_tets) > 0) // 从输入流批量读取四面体记录
+	while (ReadTetBatch(input, input_buffer, batch_tets) > 0)
 	{
 		++batch_count;
 		for (const TetRecord &record : input_buffer)
 		{
 			int Ev[10] = {0};
 			int domainidx = 0;
-			FromTetRecord(record, Ev, domainidx); // 从记录中提取四面体顶点和所属域索引
+			FromTetRecord(record, Ev, domainidx);
 
-			// 处理四面体的6条边，生成或获取每一条边的中点
 			for (int edge = 0; edge < 6; ++edge)
 			{
 				const int va = Ev[kTetEdges[edge][0]];
 				const int vb = Ev[kTetEdges[edge][1]];
-				const IntPair ordered_edge = MakeOrderedEdge(va, vb); // 创建一个有序的边对象（小顶点号在前）
+				const IntPair ordered_edge = MakeOrderedEdge(va, vb);
 
-				// 检查边是否是边界边，如果是在边界上则需要使用重心坐标规则以保证共享边一致性
 				if (boundary_edges.find(ordered_edge) != boundary_edges.end())
 				{
 					Barycentric bary0{};
 					Barycentric bary1{};
-					// 从反向哈希表中获取顶点的重心坐标信息
 					if (!TryGetVertexBarycentric(va, locvrtx2barycmap, bary0) || !TryGetVertexBarycentric(vb, locvrtx2barycmap, bary1))
 					{
 						FailStreamOperation("missing boundary barycentric mapping while refining volume stream");
 					}
-					// 利用重心坐标为主获取或创建边的中点，并更新相关的映射表
-					Ev[edge + 4] = GetOrCreateEdgeMidpoint((nglib::Ng_Mesh *)submesh, va, vb, &bary0, &bary1, baryc2locvrtxmap, locvrtx2barycmap, edgemap, nullptr);
+					Ev[edge + 4] = GetOrCreateEdgeMidpoint((nglib::Ng_Mesh *)submesh,
+						va,
+						vb,
+						&bary0,
+						&bary1,
+						baryc2locvrtxmap,
+						locvrtx2barycmap,
+						edgemap,
+						nullptr,
+						point_table_path,
+						next_point_id,
+						false);
 				}
 				else
 				{
-					// 不在边界上的边，普通地获取或创建边中点（不依赖重心坐标对齐）
-					Ev[edge + 4] = GetOrCreateEdgeMidpoint((nglib::Ng_Mesh *)submesh, va, vb, nullptr, nullptr, baryc2locvrtxmap, locvrtx2barycmap, edgemap, nullptr);
+					const EdgeKey key = PackEdgeKey(ordered_edge.x, ordered_edge.y);
+					const std::size_t shard = EdgeShardIndex(key, shard_count);
+					Ev[edge + 4] = LookupMidpointInShardVector(edge_mid_shards[shard], key);
 				}
 			}
 
-			// 将原四面体分割为8个新的子四面体，并存入输出缓冲区
 			for (int j = 0; j < 8; ++j)
 			{
 				int pointindex[4];
 				for (int k = 0; k < 4; ++k)
 				{
-					pointindex[k] = Ev[kTetRefTab[j][k]]; // 四面体细分引用表
+					pointindex[k] = Ev[kTetRefTab[j][k]];
 				}
-				output_buffer.push_back(ToTetRecord(pointindex, domainidx)); // 打包四面体顶点和域索引为定长记录
+				output_buffer.push_back(ToTetRecord(pointindex, domainidx));
 			}
 
-			// 如果输出缓冲区达到指定的容量，刷入到文件中
 			if (output_buffer.size() >= EffectiveBatch(batch_tets) * 8)
 			{
-				FlushTetBuffer(output, output_buffer); // 将四面体缓冲批量写入磁盘
+				FlushTetBuffer(output, output_buffer);
 			}
 		}
 
-		// 周期性地打印内存日志
-		if (IsPowerOfTwo(batch_count)) //判断是否为2的幂用来控制日志输出频率
+		if (IsPowerOfTwo(batch_count))
 		{
 			const std::size_t output_buffer_size = output_buffer.size();
 			PrintInnerMemLog("tet_loop", round, submesh, baryc2locvrtxmap, locvrtx2barycmap, edgemap, nullptr, &output_buffer_size);
 		}
 	}
 
-	// 阶段6：将输出缓冲中剩余的结果刷入文件，并打印退出时的内存日志
 	FlushTetBuffer(output, output_buffer);
 	PrintInnerMemLog("exit", round, submesh, baryc2locvrtxmap, locvrtx2barycmap, edgemap);
+
+	for (const std::string &filepath : edge_req_files)
+	{
+		std::filesystem::remove(filepath);
+	}
+	for (const std::string &filepath : edge_mid_files)
+	{
+		std::filesystem::remove(filepath);
+	}
 }
 
 void *ReplayTetsFromFileToMesh(void *submesh, const std::string &filepath, std::size_t batch_tets)

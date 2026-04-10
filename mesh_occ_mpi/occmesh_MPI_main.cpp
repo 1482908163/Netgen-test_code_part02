@@ -573,41 +573,47 @@ int main(int argc, char **argv) {
             // 3. 最后一轮结束后再把最终 surface/tet 回灌到 submesh。
             //
             // 这样中间轮 refined tetra 不会长时间挂在 mesh 里，从而压低峰值内存。
-            std::string surface_in = stream_dir + "/surf_rank" + str_id + "_round0.bin";
-            std::string tet_in = stream_dir + "/tet_rank" + str_id + "_round0.bin";
-            std::string surface_out = stream_dir + "/surf_rank" + str_id + "_round1.bin";
-            std::string tet_out = stream_dir + "/tet_rank" + str_id + "_round1.bin";
-            DumpCurrentSurfaceElementsToFile(submesh, surface_in, baryc2locvrtxmap, locvrtx2barycmap);
-            DumpCurrentVolumeElementsToFile(submesh, tet_in);
-            print_stage_mem("after DumpCurrentVolumeElementsToFile", id);
-            nglib::ClearSurfaceElements(submesh);
-            submesh = ClearVolumeElementsOrEquivalent(submesh);
-            print_stage_mem("after ClearVolumeElements", id);
+	            std::string surface_in = stream_dir + "/surf_rank" + str_id + "_round0.bin";
+	            std::string tet_in = stream_dir + "/tet_rank" + str_id + "_round0.bin";
+	            std::string surface_out = stream_dir + "/surf_rank" + str_id + "_round1.bin";
+	            std::string tet_out = stream_dir + "/tet_rank" + str_id + "_round1.bin";
+	            std::string point_table_path = stream_dir + "/points_rank" + str_id + ".bin";
+	            DumpCurrentSurfaceElementsToFile(submesh, surface_in, baryc2locvrtxmap, locvrtx2barycmap);
+	            DumpInitialPointsToPointTable(submesh, point_table_path);
+	            int initial_np = nglib::Ng_GetNP(submesh);
+	            int next_point_id = initial_np + 1;
+	            DumpCurrentVolumeElementsToFile(submesh, tet_in);
+	            print_stage_mem("after DumpCurrentVolumeElementsToFile", id);
+	            nglib::ClearSurfaceElements(submesh);
+	            submesh = ClearVolumeElementsOrEquivalent(submesh);
+	            print_stage_mem("after ClearVolumeElements", id);
 
-            for (i = 0; i < numrefine; i++) {
-                Refineforvol_Stream(submesh, surface_in, tet_in, surface_out, tet_out, stream_batch, stream_vol_batch, i + 1, baryc2locvrtxmap, locvrtx2barycmap, edgemap);
-                if(!keep_stream_files) {
-                    std::filesystem::remove(surface_in);
-                    std::filesystem::remove(tet_in);
-                }
+	            for (i = 0; i < numrefine; i++) {
+	                Refineforvol_Stream(submesh, surface_in, tet_in, surface_out, tet_out, point_table_path, stream_batch, stream_vol_batch, next_point_id, 16, i + 1, baryc2locvrtxmap, locvrtx2barycmap, edgemap);
+	                if(!keep_stream_files) {
+	                    std::filesystem::remove(surface_in);
+	                    std::filesystem::remove(tet_in);
+	                }
                 std::swap(surface_in, surface_out);
                 std::swap(tet_in, tet_out);
                 surface_out = stream_dir + "/surf_rank" + str_id + "_round" + std::to_string(i + 2) + ".bin";
                 tet_out = stream_dir + "/tet_rank" + str_id + "_round" + std::to_string(i + 2) + ".bin";
                 print_stage_mem("after one Refineforvol_Stream round", id);
-            }
+	            }
 
-            collect_patbound_faces_from_surface_file(surface_in, stream_batch, patbound_faces);
-            use_saved_patbound_faces = true;
-            AddFacesFromFileToMesh(submesh, surface_in, stream_batch);
-            submesh = (Ng_Mesh *)ReplayTetsFromFileToMesh(submesh, tet_in, stream_vol_batch);
-            print_stage_mem("after ReplayTetsFromFileToMesh", id);
+	            collect_patbound_faces_from_surface_file(surface_in, stream_batch, patbound_faces);
+	            use_saved_patbound_faces = true;
+	            ReplayNewPointsFromPointTableToMesh(submesh, point_table_path, initial_np + 1);
+	            AddFacesFromFileToMesh(submesh, surface_in, stream_batch);
+	            submesh = (Ng_Mesh *)ReplayTetsFromFileToMesh(submesh, tet_in, stream_vol_batch);
+	            print_stage_mem("after ReplayTetsFromFileToMesh", id);
 
-            if(!keep_stream_files) {
-                std::filesystem::remove(surface_in);
-                std::filesystem::remove(tet_in);
-            }
-        }
+	            if(!keep_stream_files) {
+	                std::filesystem::remove(surface_in);
+	                std::filesystem::remove(tet_in);
+	                std::filesystem::remove(point_table_path);
+	            }
+	        }
 
         std::string savepvname = OUTPUT_PATH + "volfined/volfined" + str_id + ".vol";
 

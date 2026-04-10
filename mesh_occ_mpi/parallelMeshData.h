@@ -43,8 +43,13 @@ struct TetRecord {
 	std::int32_t domidx;
 };
 
+struct PointCoordRecord {
+	double xyz[3];
+};
+
 static_assert(std::is_trivially_copyable<FaceRecord>::value, "FaceRecord must be trivially copyable");
 static_assert(std::is_trivially_copyable<TetRecord>::value, "TetRecord must be trivially copyable");
+static_assert(std::is_trivially_copyable<PointCoordRecord>::value, "PointCoordRecord must be trivially copyable");
 
 typedef struct xdMeshFaceInfo {
 	int procids[2];
