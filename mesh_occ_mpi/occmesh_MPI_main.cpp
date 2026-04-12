@@ -28,71 +28,6 @@ namespace nglib {
 
 nglib::Ng_Mesh *ClearVolumeElementsOrEquivalent(nglib::Ng_Mesh *mesh);
 
-struct FaceKey
-{
-    int v[3];
-
-    bool operator<(const FaceKey &other) const
-    {
-        if (v[0] != other.v[0]) return v[0] < other.v[0];
-        if (v[1] != other.v[1]) return v[1] < other.v[1];
-        return v[2] < other.v[2];
-    }
-};
-
-static FaceKey make_face_key(int a, int b, int c)
-{
-    if (a > b) std::swap(a, b);
-    if (b > c) std::swap(b, c);
-    if (a > b) std::swap(a, b);
-    FaceKey key{{a, b, c}};
-    return key;
-}
-
-static std::size_t effective_face_stream_batch(std::size_t batch_faces)
-{
-    return batch_faces == 0 ? 4096 : batch_faces;
-}
-
-static void collect_patbound_faces_from_surface_file(const std::string &filepath,
-    std::size_t batch_faces,
-    std::set<FaceKey> &patbound_faces)
-{
-    std::ifstream input(filepath, std::ios::binary);
-    if (!input)
-    {
-        std::cerr << "failed to open surface stream input file: " << filepath << std::endl;
-        std::abort();
-    }
-
-    std::vector<FaceRecord> buffer(effective_face_stream_batch(batch_faces));
-    patbound_faces.clear();
-
-    while (true)
-    {
-        input.read(reinterpret_cast<char *>(buffer.data()), static_cast<std::streamsize>(buffer.size() * sizeof(FaceRecord)));
-        const std::streamsize bytes_read = input.gcount();
-        if (bytes_read == 0)
-        {
-            break;
-        }
-        if (bytes_read < 0 || bytes_read % static_cast<std::streamsize>(sizeof(FaceRecord)) != 0)
-        {
-            std::cerr << "surface stream file is truncated: " << filepath << std::endl;
-            std::abort();
-        }
-
-        const std::size_t count = static_cast<std::size_t>(bytes_read / static_cast<std::streamsize>(sizeof(FaceRecord)));
-        for (std::size_t i = 0; i < count; ++i)
-        {
-            if (buffer[i].patbound == 1)
-            {
-                patbound_faces.insert(make_face_key(buffer[i].lsvrtx[0], buffer[i].lsvrtx[1], buffer[i].lsvrtx[2]));
-            }
-        }
-    }
-}
-
 static double get_current_rss_mb()
 {
     std::ifstream status("/proc/self/status");
@@ -622,7 +557,263 @@ int main(int argc, char **argv) {
 
 		            print_stage_mem("before final replay/postprocess", id);
 		            if(stream_final_mode == "file_only") {
+		                StreamMeshView smv;
+		                InitStreamMeshView(smv, point_table_path, surface_in, tet_in);
+		                const int stream_np = StreamMesh_GetNP(smv);
+		                const int stream_nse = StreamMesh_GetNSE(smv);
+		                const int stream_ne = StreamMesh_GetNE(smv);
+		                double p1_xyz[3] = {0.0, 0.0, 0.0};
+		                int s1_tri[3] = {0, 0, 0};
+		                int s1_surfidx = 0;
+		                int e1_tet[4] = {0, 0, 0, 0};
+		                int e1_domidx = 0;
+		                StreamMesh_GetPoint(smv, 1, p1_xyz);
+		                StreamMesh_GetSurfaceElement(smv, 1, s1_tri, s1_surfidx);
+		                StreamMesh_GetVolumeElement(smv, 1, e1_tet, e1_domidx);
+		                const std::string streammesh_dump_path = OUTPUT_PATH + "testout/testout_streammesh.txt";
+		                std::map<Barycvrtx, std::list<int>, CompBarycvrtx> barycvrtx2adjprocsmap_stream;
+		                computeadj(id, facemap, g2lvrtxmap, barycvrtx2adjprocsmap_stream);
+		                if(barycvrtx2adjprocsmap_stream.empty()) {
+		                    std::cout << "[STREAM-WARN] computeadj produced empty adjacency map on rank " << id << std::endl;
+		                }
+		                std::filesystem::create_directories(OUTPUT_PATH + "testout");
+		                const std::string streamadj_dump_path = OUTPUT_PATH + "testout/testout_streamadj.txt";
+		                int *VEgid = nullptr;
+		                MYCALLOC(VEgid, int *, (stream_ne + 1), sizeof(int));
+		                std::map<int, std::list<int>> adjbarycs_stream;
+		                int *newid = com_barycoords_from_streams(
+		                    smv,
+		                    MPI_COMM_WORLD,
+		                    barycvrtx2adjprocsmap_stream,
+		                    baryc2locvrtxmap,
+		                    adjbarycs_stream,
+		                    numParts,
+		                    VEgid,
+		                    id);
+		                WritePartitionNodesElementsFromStreams(
+		                    smv,
+		                    OUTPUT_PATH,
+		                    numParts,
+		                    id,
+		                    newid,
+		                    VEgid);
+		                WritePartitionSharedFromAdjBarycs(
+		                    OUTPUT_PATH,
+		                    numParts,
+		                    id,
+		                    newid,
+		                    adjbarycs_stream);
+		                const StreamBoundaryHeaderStats bh_stats =
+		                    WritePartitionBoundaryAndHeaderFromStreams(
+		                        smv,
+		                        OUTPUT_PATH,
+		                        numParts,
+		                        id,
+		                        newid,
+		                        VEgid,
+		                        adjbarycs_stream);
+		                const StreamMeshQualityStats mq_stats = ComputeMeshQualityFromStreams(smv);
+		                WriteMeshQualityFromStreams(OUTPUT_PATH, id, mq_stats);
+		                StreamVolWithAdjData voladj_data;
+		                com_baryVolumeElements_from_streams(
+		                    smv,
+		                    MPI_COMM_WORLD,
+		                    adjbarycs_stream,
+		                    newid,
+		                    VEgid,
+		                    numParts,
+		                    id,
+		                    voladj_data);
+		                WriteVolWithAdjFromStreams(OUTPUT_PATH, id, voladj_data);
+		                const std::string stream_barycoords_dump_path = OUTPUT_PATH + "testout/testout_stream_barycoords.txt";
+		                const std::string stream_shared_dump_path = OUTPUT_PATH + "testout/testout_stream_shared.txt";
+		                const std::string stream_boundary_dump_path = OUTPUT_PATH + "testout/testout_stream_boundary.txt";
+		                const std::string stream_meshquality_dump_path = OUTPUT_PATH + "testout/testout_stream_meshquality.txt";
+		                const std::string stream_volwithadj_dump_path = OUTPUT_PATH + "testout/testout_stream_volwithadj.txt";
+		                const std::string stream_newid_duplicates_dump_path = OUTPUT_PATH + "testout/testout_stream_newid_duplicates.txt";
+		                const int first_newid = (stream_np >= 1) ? newid[1] : 0;
+		                const int first_vegid = (stream_ne >= 1) ? VEgid[1] : 0;
+		                const int local_points = stream_np;
+		                const int local_tets = stream_ne;
+		                const int ghost_added_points = static_cast<int>(voladj_data.points.size()) - local_points;
+		                const int ghost_added_tets = static_cast<int>(voladj_data.ghost_tets.size());
+		                const int final_points = static_cast<int>(voladj_data.points.size());
+		                const int final_tets = static_cast<int>(voladj_data.local_tets.size() + voladj_data.ghost_tets.size());
+		                int shared_vertex_count = 0;
+		                int owned_shared_vertex_count = 0;
+		                int received_shared_vertex_count = 0;
+		                for(const auto &entry : baryc2locvrtxmap) {
+		                    Barycvrtx key;
+		                    key.gvrtx[0] = entry.first.gvrtx[0];
+		                    key.gvrtx[1] = entry.first.gvrtx[1];
+		                    key.gvrtx[2] = entry.first.gvrtx[2];
+		                    const auto adj_it = barycvrtx2adjprocsmap_stream.find(key);
+		                    if(adj_it == barycvrtx2adjprocsmap_stream.end()) {
+		                        continue;
+		                    }
+		                    ++shared_vertex_count;
+		                    std::vector<int> holders;
+		                    holders.push_back(id);
+		                    holders.insert(holders.end(), adj_it->second.begin(), adj_it->second.end());
+		                    std::sort(holders.begin(), holders.end());
+		                    if(adj_it->second.empty()) {
+		                        std::cerr << "[STREAM-ERR] empty adjacency list for shared barycentric vertex on rank " << id << std::endl;
+		                        MPI_Abort(MPI_COMM_WORLD, 1);
+		                        return 1;
+		                    }
+		                    const int owner_index =
+		                        (entry.first.gvrtx[0] + entry.first.gvrtx[1] + entry.first.gvrtx[2] +
+		                         entry.first.coord[0] + entry.first.coord[1] + entry.first.coord[2]) %
+		                        static_cast<int>(adj_it->second.size());
+		                    const int ownerpid = holders[owner_index];
+		                    if(ownerpid == id) {
+		                        ++owned_shared_vertex_count;
+		                    }
+		                    else {
+		                        ++received_shared_vertex_count;
+		                    }
+		                }
+		                std::set<int> unique_newids;
+		                int minus_one_count = 0;
+		                for(int local_vid = 1; local_vid <= stream_np; ++local_vid) {
+		                    if(newid[local_vid] == -1) {
+		                        ++minus_one_count;
+		                    }
+		                    else if(newid[local_vid] > 0) {
+		                        unique_newids.insert(newid[local_vid]);
+		                    }
+		                }
+		                int shared_line_count = 0;
+		                std::vector<std::string> shared_samples;
+		                shared_samples.reserve(5);
+		                for(const auto &entry : adjbarycs_stream) {
+		                    std::vector<int> parts;
+		                    parts.push_back(id);
+		                    parts.insert(parts.end(), entry.second.begin(), entry.second.end());
+		                    std::sort(parts.begin(), parts.end());
+		                    parts.erase(std::unique(parts.begin(), parts.end()), parts.end());
+		                    if(parts.size() <= 1) {
+		                        continue;
+		                    }
+		                    ++shared_line_count;
+		                    if(shared_samples.size() < 5) {
+		                        std::ostringstream sample;
+		                        sample << "item" << shared_samples.size() << "=" << newid[entry.first] << " -> ";
+		                        for(std::size_t part_idx = 0; part_idx < parts.size(); ++part_idx) {
+		                            sample << (parts[part_idx] + 1);
+		                            if(part_idx + 1 < parts.size()) {
+		                                sample << " ";
+		                            }
+		                        }
+		                        shared_samples.push_back(sample.str());
+		                    }
+		                }
+		                std::set<FaceKey> patbound_faces_stream;
+		                CollectPatboundFacesFromSurfaceFile(smv.surface_file_path, patbound_faces_stream);
+		                const std::filesystem::path boundary_file_path =
+		                    std::filesystem::path(OUTPUT_PATH) /
+		                    ("partitioning." + std::to_string(numParts)) /
+		                    ("part." + std::to_string(id + 1) + ".boundary");
+		                std::vector<std::string> boundary_samples;
+		                boundary_samples.reserve(5);
+		                {
+		                    std::ifstream boundary_input(boundary_file_path);
+		                    std::string boundary_line;
+		                    while (std::getline(boundary_input, boundary_line) && boundary_samples.size() < 5) {
+		                        if (!boundary_line.empty()) {
+		                            std::ostringstream sample;
+		                            sample << "item" << boundary_samples.size() << "=" << boundary_line;
+		                            boundary_samples.push_back(sample.str());
+		                        }
+		                    }
+		                }
 		                if(id == 0) {
+		                    std::ofstream reset_streammesh_dump(streammesh_dump_path, std::ios::trunc);
+		                    std::ofstream reset_streamadj_dump(streamadj_dump_path, std::ios::trunc);
+		                    std::ofstream reset_stream_barycoords_dump(stream_barycoords_dump_path, std::ios::trunc);
+		                    std::ofstream reset_stream_shared_dump(stream_shared_dump_path, std::ios::trunc);
+		                    std::ofstream reset_stream_boundary_dump(stream_boundary_dump_path, std::ios::trunc);
+		                    std::ofstream reset_stream_meshquality_dump(stream_meshquality_dump_path, std::ios::trunc);
+		                    std::ofstream reset_stream_volwithadj_dump(stream_volwithadj_dump_path, std::ios::trunc);
+		                    std::ofstream reset_stream_newid_duplicates_dump(stream_newid_duplicates_dump_path, std::ios::trunc);
+		                }
+		                MPI_Barrier(MPI_COMM_WORLD);
+		                for(int writer_rank = 0; writer_rank < p; ++writer_rank) {
+		                    if(id == writer_rank) {
+		                        std::ofstream streammesh_dump(streammesh_dump_path, std::ios::app);
+		                        streammesh_dump << "rank=" << id << "\n";
+		                        streammesh_dump << "stream np=" << stream_np << "\n";
+		                        streammesh_dump << "stream nse=" << stream_nse << "\n";
+		                        streammesh_dump << "stream ne=" << stream_ne << "\n";
+		                        streammesh_dump << "p1=" << p1_xyz[0] << " " << p1_xyz[1] << " " << p1_xyz[2] << "\n";
+		                        streammesh_dump << "s1=" << s1_tri[0] << " " << s1_tri[1] << " " << s1_tri[2] << " surfidx=" << s1_surfidx << "\n";
+		                        streammesh_dump << "e1=" << e1_tet[0] << " " << e1_tet[1] << " " << e1_tet[2] << " " << e1_tet[3] << " domidx=" << e1_domidx << "\n";
+		                        streammesh_dump << "\n";
+		                        DumpAdjBarycsSummary(streamadj_dump_path, id, barycvrtx2adjprocsmap_stream);
+		                        std::ofstream stream_barycoords_dump(stream_barycoords_dump_path, std::ios::app);
+		                        stream_barycoords_dump << "rank=" << id << "\n";
+		                        stream_barycoords_dump << "np=" << stream_np << "\n";
+		                        stream_barycoords_dump << "ne=" << stream_ne << "\n";
+		                        stream_barycoords_dump << "shared_vertex_count=" << shared_vertex_count << "\n";
+		                        stream_barycoords_dump << "owned_shared_vertex_count=" << owned_shared_vertex_count << "\n";
+		                        stream_barycoords_dump << "received_shared_vertex_count=" << received_shared_vertex_count << "\n";
+		                        stream_barycoords_dump << "newid[1]=" << first_newid << "\n";
+		                        stream_barycoords_dump << "VEgid[1]=" << first_vegid << "\n";
+		                        stream_barycoords_dump << "adjbarycs.size()=" << adjbarycs_stream.size() << "\n";
+		                        stream_barycoords_dump << "\n";
+		                        std::ofstream stream_shared_dump(stream_shared_dump_path, std::ios::app);
+		                        stream_shared_dump << "rank=" << id << "\n";
+		                        stream_shared_dump << "adjbarycs.size()=" << adjbarycs_stream.size() << "\n";
+		                        stream_shared_dump << "shared_line_count=" << shared_line_count << "\n";
+		                        for(const std::string &sample : shared_samples) {
+		                            stream_shared_dump << sample << "\n";
+		                        }
+		                        stream_shared_dump << "\n";
+		                        std::ofstream stream_boundary_dump(stream_boundary_dump_path, std::ios::app);
+		                        stream_boundary_dump << "rank=" << id << "\n";
+		                        stream_boundary_dump << "np=" << stream_np << "\n";
+		                        stream_boundary_dump << "ne=" << stream_ne << "\n";
+		                        stream_boundary_dump << "nse=" << stream_nse << "\n";
+		                        stream_boundary_dump << "patbound_faces.size()=" << patbound_faces_stream.size() << "\n";
+		                        stream_boundary_dump << "boundary_count=" << bh_stats.boundary_count << "\n";
+		                        for(const std::string &sample : boundary_samples) {
+		                            stream_boundary_dump << sample << "\n";
+		                        }
+		                        stream_boundary_dump << "\n";
+		                        std::ofstream stream_meshquality_dump(stream_meshquality_dump_path, std::ios::app);
+		                        stream_meshquality_dump << std::setprecision(17);
+		                        stream_meshquality_dump << "rank=" << id << "\n";
+		                        stream_meshquality_dump << "ne=" << mq_stats.ne << "\n";
+		                        stream_meshquality_dump << "min_volume=" << mq_stats.min_volume << "\n";
+		                        stream_meshquality_dump << "max_volume=" << mq_stats.max_volume << "\n";
+		                        stream_meshquality_dump << "avg_volume=" << mq_stats.avg_volume << "\n";
+		                        stream_meshquality_dump << "\n";
+		                        std::ofstream stream_volwithadj_dump(stream_volwithadj_dump_path, std::ios::app);
+		                        stream_volwithadj_dump << "rank=" << id << "\n";
+		                        stream_volwithadj_dump << "local_points=" << local_points << "\n";
+		                        stream_volwithadj_dump << "ghost_added_points=" << ghost_added_points << "\n";
+		                        stream_volwithadj_dump << "local_tets=" << local_tets << "\n";
+		                        stream_volwithadj_dump << "ghost_added_tets=" << ghost_added_tets << "\n";
+		                        stream_volwithadj_dump << "final_points=" << final_points << "\n";
+		                        stream_volwithadj_dump << "final_tets=" << final_tets << "\n";
+		                        stream_volwithadj_dump << "\n";
+		                        std::ofstream stream_newid_duplicates_dump(stream_newid_duplicates_dump_path, std::ios::app);
+		                        stream_newid_duplicates_dump << "rank=" << id << "\n";
+		                        stream_newid_duplicates_dump << "local_np=" << stream_np << "\n";
+		                        stream_newid_duplicates_dump << "unique_newid_count=" << unique_newids.size() << "\n";
+		                        stream_newid_duplicates_dump << "minus_one_count=" << minus_one_count << "\n";
+		                        stream_newid_duplicates_dump << "\n";
+		                    }
+		                    MPI_Barrier(MPI_COMM_WORLD);
+		                }
+		                if(id == 0) {
+		                    std::cout << "[STREAM] computeadj in file_only mode finished" << std::endl;
+		                    std::cout << "[STREAM] com_barycoords_from_streams finished" << std::endl;
+		                    std::cout << "[STREAM] partition nodes/elements written from streams" << std::endl;
+		                    std::cout << "[STREAM] partition shared written from streams" << std::endl;
+		                    std::cout << "[STREAM] partition boundary/header written from streams" << std::endl;
+		                    std::cout << "[STREAM] meshQuality written from streams" << std::endl;
+		                    std::cout << "[STREAM] volwithadj written from streams" << std::endl;
 		                    std::cout << "[STREAM] final mode=file_only, skip replay/postprocess" << std::endl;
 		                }
 		                if(save_vol) {
@@ -633,11 +824,13 @@ int main(int argc, char **argv) {
 		                        return 1;
 		                    }
 		                }
+		                free(newid);
+		                free(VEgid);
 		                print_stage_mem("after final replay/postprocess", id);
 		                skip_final_mesh_postprocess = true;
 		            }
 		            else {
-		                collect_patbound_faces_from_surface_file(surface_in, stream_batch, patbound_faces);
+		                CollectPatboundFacesFromSurfaceFile(surface_in, patbound_faces);
 		                use_saved_patbound_faces = true;
 		                ReplayNewPointsFromPointTableToMesh(submesh, point_table_path, initial_np + 1);
 		                AddFacesFromFileToMesh(submesh, surface_in, stream_batch);

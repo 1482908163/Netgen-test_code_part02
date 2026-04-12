@@ -58,6 +58,111 @@ struct EdgeMidRecord {
 	int mid;
 };
 
+class Index3
+{
+public:
+	int x[3];
+
+	Index3()
+	{
+		x[0] = 0;
+		x[1] = 0;
+		x[2] = 0;
+	}
+
+	void swapel(int a, int b)
+	{
+		int tmp = x[a];
+		x[a] = x[b];
+		x[b] = tmp;
+	}
+
+	void Sort()
+	{
+		if (x[1] < x[0]) swapel(1, 0);
+		if (x[2] < x[1]) swapel(2, 1);
+		if (x[1] < x[0]) swapel(1, 0);
+	}
+};
+
+bool fncomp(Index3 in1, Index3 in2)
+{
+	if (in1.x[0] < in2.x[0])
+		return true;
+	else if (in1.x[0] > in2.x[0])
+		return false;
+
+	if (in1.x[1] < in2.x[1])
+		return true;
+	else if (in1.x[1] > in2.x[1])
+		return false;
+
+	if (in1.x[2] < in2.x[2])
+		return true;
+	else if (in1.x[2] > in2.x[2])
+		return false;
+
+	return false;
+}
+
+void VecSub(const double a[3], const double b[3], double out[3])
+{
+	out[0] = a[0] - b[0];
+	out[1] = a[1] - b[1];
+	out[2] = a[2] - b[2];
+}
+
+double Dot3(const double a[3], const double b[3])
+{
+	return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+void Cross3(const double a[3], const double b[3], double out[3])
+{
+	out[0] = a[1] * b[2] - a[2] * b[1];
+	out[1] = a[2] * b[0] - a[0] * b[2];
+	out[2] = a[0] * b[1] - a[1] * b[0];
+}
+
+double TetVolumeFromPoints(const double p0[3],
+	const double p1[3],
+	const double p2[3],
+	const double p3[3])
+{
+	double a[3];
+	double b[3];
+	double c[3];
+	double cross_bc[3];
+	VecSub(p1, p0, a);
+	VecSub(p2, p0, b);
+	VecSub(p3, p0, c);
+	Cross3(b, c, cross_bc);
+	return fabs(Dot3(a, cross_bc)) / 6.0;
+}
+
+MPI_Datatype CreateMpiGhostVeType()
+{
+	StreamGhostVE dummy{};
+	int blocklens[4] = {1, 1, 4, 12};
+	MPI_Aint addrs[4];
+	MPI_Datatype mpitypes[4] = {MPI_INT, MPI_INT, MPI_INT, MPI_DOUBLE};
+	MPI_Datatype dtype;
+
+	MPI_Get_address(&dummy.gid, &addrs[0]);
+	MPI_Get_address(&dummy.domidx, &addrs[1]);
+	MPI_Get_address(&dummy.pindex, &addrs[2]);
+	MPI_Get_address(&dummy.xyz, &addrs[3]);
+
+	addrs[3] -= addrs[0];
+	addrs[2] -= addrs[0];
+	addrs[1] -= addrs[0];
+	addrs[0] = static_cast<MPI_Aint>(0);
+
+	MPI_Type_create_struct(4, blocklens, addrs, mpitypes, &dtype);
+	MPI_Type_commit(&dtype);
+	return dtype;
+}
+
 static_assert(std::is_trivially_copyable<EdgeReqRecord>::value, "EdgeReqRecord must be trivially copyable");
 static_assert(std::is_trivially_copyable<EdgeMidRecord>::value, "EdgeMidRecord must be trivially copyable");
 
@@ -234,6 +339,95 @@ int GetPointRecordCount(const std::string &path)
 		FailStreamOperation("point table file is truncated: " + path);
 	}
 	return static_cast<int>(filesize / sizeof(PointCoordRecord));
+}
+
+int CountRecordsByFileSize(const std::string &path, std::size_t record_size)
+{
+	if (!std::filesystem::exists(path))
+	{
+		FailStreamOperation("stream file does not exist: " + path);
+	}
+	const std::uintmax_t filesize = std::filesystem::file_size(path);
+	if (record_size == 0 || filesize % record_size != 0)
+	{
+		FailStreamOperation("stream file size is not aligned to record size: " + path);
+	}
+	return static_cast<int>(filesize / record_size);
+}
+
+Barycvrtx ToBarycvrtxKey(const Barycentric &bary)
+{
+	Barycvrtx key;
+	key.gvrtx[0] = bary.gvrtx[0];
+	key.gvrtx[1] = bary.gvrtx[1];
+	key.gvrtx[2] = bary.gvrtx[2];
+	return key;
+}
+
+std::string DescribeBarycentricKey(const Barycentric &bary)
+{
+	std::ostringstream oss;
+	oss << "gvrtx=("
+	    << bary.gvrtx[0] << ","
+	    << bary.gvrtx[1] << ","
+	    << bary.gvrtx[2] << ") coord=("
+	    << bary.coord[0] << ","
+	    << bary.coord[1] << ","
+	    << bary.coord[2] << ")";
+	return oss.str();
+}
+
+std::vector<int> NormalizeSharedAdjRanks(const std::list<int> &adj_list, int self_id)
+{
+	std::vector<int> adj(adj_list.begin(), adj_list.end());
+	std::sort(adj.begin(), adj.end());
+	adj.erase(std::unique(adj.begin(), adj.end()), adj.end());
+	adj.erase(std::remove(adj.begin(), adj.end(), self_id), adj.end());
+	return adj;
+}
+
+FaceRecord ReadFaceRecordByIndex(const std::string &path, int sid)
+{
+	if (sid < 1)
+	{
+		FailStreamOperation("invalid surface element id for stream file lookup: " + std::to_string(sid));
+	}
+	std::ifstream input(path, std::ios::binary);
+	if (!input)
+	{
+		FailStreamOperation("failed to open surface stream file: " + path);
+	}
+	const std::streamoff offset = static_cast<std::streamoff>(sid - 1) * static_cast<std::streamoff>(sizeof(FaceRecord));
+	input.seekg(offset, std::ios::beg);
+	FaceRecord record{};
+	input.read(reinterpret_cast<char *>(&record), static_cast<std::streamsize>(sizeof(FaceRecord)));
+	if (!input)
+	{
+		FailStreamOperation("failed to read surface stream record: " + path);
+	}
+	return record;
+}
+
+TetRecord ReadTetRecordByIndex(const std::string &path, int eid)
+{
+	if (eid < 1)
+	{
+		FailStreamOperation("invalid volume element id for stream file lookup: " + std::to_string(eid));
+	}
+	std::ifstream input(path, std::ios::binary);
+	if (!input)
+	{
+		FailStreamOperation("failed to open tet stream file: " + path);
+	}
+	const std::streamoff offset = static_cast<std::streamoff>(eid - 1) * static_cast<std::streamoff>(sizeof(TetRecord));
+	input.seekg(offset, std::ios::beg);
+	TetRecord record{};
+	input.read(reinterpret_cast<char *>(&record), static_cast<std::streamsize>(sizeof(TetRecord)));
+	if (!input)
+	{
+		FailStreamOperation("failed to read tet stream record: " + path);
+	}
+	return record;
 }
 
 void FailStreamOperation(const std::string &message)
@@ -1111,6 +1305,876 @@ void ReplayNewPointsFromPointTableToMesh(void *submesh, const std::string &point
 			FailStreamOperation("point renumbering changed while replaying point table");
 		}
 	}
+}
+
+bool InitStreamMeshView(StreamMeshView &view,
+	const std::string &point_table_path,
+	const std::string &surface_file_path,
+	const std::string &tet_file_path)
+{
+	view.point_table_path = point_table_path;
+	view.surface_file_path = surface_file_path;
+	view.tet_file_path = tet_file_path;
+	view.np = CountRecordsByFileSize(point_table_path, sizeof(PointCoordRecord));
+	view.nse = CountRecordsByFileSize(surface_file_path, sizeof(FaceRecord));
+	view.ne = CountRecordsByFileSize(tet_file_path, sizeof(TetRecord));
+	return true;
+}
+
+int StreamMesh_GetNP(const StreamMeshView &view)
+{
+	return view.np;
+}
+
+int StreamMesh_GetNSE(const StreamMeshView &view)
+{
+	return view.nse;
+}
+
+int StreamMesh_GetNE(const StreamMeshView &view)
+{
+	return view.ne;
+}
+
+void StreamMesh_GetPoint(const StreamMeshView &view, int pid, double xyz[3])
+{
+	if (pid < 1 || pid > view.np)
+	{
+		FailStreamOperation("stream mesh point id out of range: " + std::to_string(pid));
+	}
+	ReadPointRecord(view.point_table_path, pid, xyz);
+}
+
+void StreamMesh_GetSurfaceElement(const StreamMeshView &view, int sid, int tri[3], int &surfidx)
+{
+	if (sid < 1 || sid > view.nse)
+	{
+		FailStreamOperation("stream mesh surface element id out of range: " + std::to_string(sid));
+	}
+	const xdFace face = FromFaceRecord(ReadFaceRecordByIndex(view.surface_file_path, sid));
+	for (int i = 0; i < 3; ++i)
+	{
+		tri[i] = face.lsvrtx[i];
+	}
+	surfidx = face.geoboundary;
+}
+
+void StreamMesh_GetVolumeElement(const StreamMeshView &view, int eid, int tet[4], int &domidx)
+{
+	if (eid < 1 || eid > view.ne)
+	{
+		FailStreamOperation("stream mesh volume element id out of range: " + std::to_string(eid));
+	}
+	FromTetRecord(ReadTetRecordByIndex(view.tet_file_path, eid), tet, domidx);
+}
+
+int *com_barycoords_from_streams(
+	const StreamMeshView &smv,
+	MPI_Comm comm,
+	const std::map<Barycvrtx, std::list<int>, CompBarycvrtx> &barycvrtx2adjprocsmap,
+	const std::map<Barycentric, int, CompBarycentric> &baryc2locvrtxmap,
+	std::map<int, std::list<int>> &adjbarycs,
+	int numParts,
+	int *VEgid,
+	int id)
+{
+	const int np = StreamMesh_GetNP(smv);
+	const int ne = StreamMesh_GetNE(smv);
+
+	adjbarycs.clear();
+
+	int count = 3;
+	int blocklens[3];
+	MPI_Aint addrs[3];
+	MPI_Datatype mpitypes[3];
+	MPI_Datatype mpibaryctype;
+	int num_s = 0;
+	int num_r = 0;
+	int *dest = nullptr;
+	int *src = nullptr;
+	int *s_length = nullptr;
+	int *r_length = nullptr;
+	Barycentric **s_data = nullptr;
+	Barycentric **r_data = nullptr;
+	Barycentric brcy{};
+	std::map<int, BarycVector *> pidmap;
+	std::map<int, int> srcmap;
+	int *globoffsets = nullptr;
+	int *globoffsetsml = nullptr;
+	int *globoffsetsVE = nullptr;
+	int *globoffsetsmlVE = nullptr;
+	int *newgid = nullptr;
+	int newglobalnocounter = 0;
+	std::list<int> pids;
+
+	MYCALLOC(newgid, int *, (np + 1), sizeof(int));
+
+	blocklens[0] = 3;
+	blocklens[1] = 3;
+	blocklens[2] = 1;
+	mpitypes[0] = MPI_INT;
+	mpitypes[1] = MPI_SHORT;
+	mpitypes[2] = MPI_INT;
+	MPI_Get_address(&brcy.gvrtx, addrs);
+	MPI_Get_address(&brcy.coord, addrs + 1);
+	MPI_Get_address(&brcy.newgid, addrs + 2);
+	addrs[1] = addrs[1] - addrs[0];
+	addrs[2] = addrs[2] - addrs[0];
+	addrs[0] = static_cast<MPI_Aint>(0);
+	MPI_Type_create_struct(count, blocklens, addrs, mpitypes, &mpibaryctype);
+	MPI_Type_commit(&mpibaryctype);
+
+	for (const auto &entry : baryc2locvrtxmap)
+	{
+		brcy = entry.first;
+		const int locid = entry.second;
+		if (locid < 1 || locid > np)
+		{
+			FailStreamOperation("stream barycentric local vertex id out of range: " + std::to_string(locid));
+		}
+
+		const Barycvrtx key = ToBarycvrtxKey(brcy);
+		const auto ibc = barycvrtx2adjprocsmap.find(key);
+		if (ibc == barycvrtx2adjprocsmap.end())
+		{
+			continue;
+		}
+		if (ibc->second.empty())
+		{
+			FailStreamOperation("shared barycentric vertex has empty adjacency list: " + DescribeBarycentricKey(brcy));
+		}
+
+		pids = ibc->second;
+		adjbarycs[locid] = pids;
+
+		std::vector<int> holders;
+		holders.push_back(id);
+		for (const int pid : ibc->second)
+		{
+			holders.push_back(pid);
+		}
+		std::sort(holders.begin(), holders.end());
+
+		const int indxowner =
+			(brcy.gvrtx[0] + brcy.gvrtx[1] + brcy.gvrtx[2] +
+			 brcy.coord[0] + brcy.coord[1] + brcy.coord[2]) %
+			static_cast<int>(ibc->second.size());
+		const int ownerpid = holders[indxowner];
+		if (ownerpid == id)
+		{
+			++newglobalnocounter;
+			newgid[locid] = newglobalnocounter;
+			brcy.newgid = newglobalnocounter;
+			for (const int pid : ibc->second)
+			{
+				auto ipdt = pidmap.find(pid);
+				if (ipdt == pidmap.end())
+				{
+					pidmap[pid] = new BarycVector();
+				}
+				pidmap[pid]->push_back(brcy);
+			}
+		}
+		else
+		{
+			newgid[locid] = -1;
+			auto srcit = srcmap.find(ownerpid);
+			if (srcit == srcmap.end())
+			{
+				srcmap[ownerpid] = 1;
+			}
+			else
+			{
+				srcit->second = srcit->second + 1;
+			}
+		}
+	}
+
+	for (int locid = 1; locid <= np; ++locid)
+	{
+		if (newgid[locid] == 0)
+		{
+			++newglobalnocounter;
+			newgid[locid] = newglobalnocounter;
+		}
+	}
+
+	MYCALLOC(globoffsetsml, int *, (numParts + 1), sizeof(int));
+	globoffsets = globoffsetsml + 1;
+	globoffsets[-1] = 0;
+	MPI_Allgather(&newglobalnocounter, 1, MPI_INT, globoffsets, 1, MPI_INT, comm);
+	for (int i = 0; i < numParts; ++i)
+	{
+		globoffsets[i] += globoffsets[i - 1];
+	}
+	for (int locid = 1; locid <= np; ++locid)
+	{
+		if (newgid[locid] != -1)
+		{
+			newgid[locid] += globoffsets[id - 1];
+		}
+	}
+
+	MYCALLOC(globoffsetsmlVE, int *, (numParts + 1), sizeof(int));
+	globoffsetsVE = globoffsetsmlVE + 1;
+	globoffsetsVE[-1] = 0;
+	MPI_Allgather(&ne, 1, MPI_INT, globoffsetsVE, 1, MPI_INT, comm);
+	for (int i = 0; i < numParts; ++i)
+	{
+		globoffsetsVE[i] += globoffsetsVE[i - 1];
+	}
+	for (int locVEid = 1; locVEid <= ne; ++locVEid)
+	{
+		VEgid[locVEid] = locVEid + globoffsetsVE[id - 1];
+	}
+
+	num_s = static_cast<int>(pidmap.size());
+	if (num_s > 0)
+	{
+		MYCALLOC(s_length, int *, num_s, sizeof(int));
+		MYCALLOC(dest, int *, num_s, sizeof(int));
+		MYCALLOC(s_data, Barycentric **, num_s, sizeof(Barycentric *));
+	}
+	int send_index = 0;
+	for (auto ipdt = pidmap.begin(); ipdt != pidmap.end(); ++ipdt, ++send_index)
+	{
+		s_length[send_index] = static_cast<int>(ipdt->second->size());
+		dest[send_index] = ipdt->first;
+		s_data[send_index] = &((*ipdt->second)[0]);
+	}
+
+	num_r = static_cast<int>(srcmap.size());
+	if (num_r > 0)
+	{
+		MYCALLOC(r_length, int *, num_r, sizeof(int));
+		MYCALLOC(src, int *, num_r, sizeof(int));
+		MYCALLOC(r_data, Barycentric **, num_r, sizeof(Barycentric *));
+	}
+	int recv_index = 0;
+	for (auto srcit = srcmap.begin(); srcit != srcmap.end(); ++srcit, ++recv_index)
+	{
+		src[recv_index] = srcit->first;
+		r_length[recv_index] = srcit->second;
+	}
+	for (int i = 0; i < num_r; ++i)
+	{
+		MYCALLOC(r_data[i], Barycentric *, r_length[i], sizeof(Barycentric));
+	}
+
+	com_sr_datatype(comm, num_s, num_r, dest, src, s_length, r_length, s_data, r_data, mpibaryctype, id);
+	for (int i = 0; i < num_r; ++i)
+	{
+		for (int j = 0; j < r_length[i]; ++j)
+		{
+			const auto locit = baryc2locvrtxmap.find(r_data[i][j]);
+			if (locit == baryc2locvrtxmap.end())
+			{
+				FailStreamOperation(
+					"received shared barycentric vertex not found in baryc2locvrtxmap from rank " +
+					std::to_string(src[i]) + ": " + DescribeBarycentricKey(r_data[i][j]));
+			}
+			const int locid = locit->second;
+			if (newgid[locid] != -1)
+			{
+				FailStreamOperation("remote global id overwrite detected for local vertex " + std::to_string(locid));
+			}
+			newgid[locid] = r_data[i][j].newgid + globoffsets[src[i] - 1];
+		}
+	}
+
+	for (auto &entry : pidmap)
+	{
+		delete entry.second;
+	}
+	for (int i = 0; i < num_r; ++i)
+	{
+		free(r_data[i]);
+	}
+	if (num_s > 0)
+	{
+		free(s_length);
+		free(s_data);
+		free(dest);
+	}
+	if (num_r > 0)
+	{
+		free(r_length);
+		free(r_data);
+		free(src);
+	}
+	free(globoffsetsml);
+	free(globoffsetsmlVE);
+	MPI_Type_free(&mpibaryctype);
+	return newgid;
+}
+
+void WritePartitionNodesElementsFromStreams(
+	const StreamMeshView &smv,
+	const std::string &output_path,
+	int numParts,
+	int id,
+	const int *newid,
+	const int *VEgid)
+{
+	const std::filesystem::path partition_dir =
+		std::filesystem::path(output_path) / ("partitioning." + std::to_string(numParts));
+	std::filesystem::create_directories(partition_dir);
+
+	const std::filesystem::path element_path =
+		partition_dir / ("part." + std::to_string(id + 1) + ".elements");
+	const std::filesystem::path node_path =
+		partition_dir / ("part." + std::to_string(id + 1) + ".nodes");
+
+	std::ofstream outelements(element_path);
+	if (!outelements)
+	{
+		FailStreamOperation("failed to open partition elements file: " + element_path.string());
+	}
+
+	const int ne = StreamMesh_GetNE(smv);
+	for (int i = 1; i <= ne; ++i)
+	{
+		int tet[4];
+		int domidx = 0;
+		StreamMesh_GetVolumeElement(smv, i, tet, domidx);
+		outelements << VEgid[i] << " 1 504 "
+		            << newid[tet[0]] << " "
+		            << newid[tet[1]] << " "
+		            << newid[tet[2]] << " "
+		            << newid[tet[3]] << std::endl;
+	}
+
+	std::ofstream outnodes(node_path);
+	if (!outnodes)
+	{
+		FailStreamOperation("failed to open partition nodes file: " + node_path.string());
+	}
+
+	const int np = StreamMesh_GetNP(smv);
+	for (int i = 1; i <= np; ++i)
+	{
+		double point[3];
+		StreamMesh_GetPoint(smv, i, point);
+		outnodes << newid[i] << " -1 "
+		         << point[0] << " "
+		         << point[1] << " "
+		         << point[2] << std::endl;
+	}
+}
+
+void WritePartitionSharedFromAdjBarycs(
+	const std::string &output_path,
+	int numParts,
+	int id,
+	const int *newid,
+	const std::map<int, std::list<int>> &adjbarycs)
+{
+	const std::filesystem::path partition_dir =
+		std::filesystem::path(output_path) / ("partitioning." + std::to_string(numParts));
+	std::filesystem::create_directories(partition_dir);
+
+	const std::filesystem::path shared_path =
+		partition_dir / ("part." + std::to_string(id + 1) + ".shared");
+	std::ofstream out(shared_path);
+	if (!out)
+	{
+		FailStreamOperation("failed to open partition shared file: " + shared_path.string());
+	}
+
+	for (const auto &entry : adjbarycs)
+	{
+		const int locid = entry.first;
+		std::vector<int> others(entry.second.begin(), entry.second.end());
+		std::sort(others.begin(), others.end());
+		others.erase(std::unique(others.begin(), others.end()), others.end());
+		others.erase(std::remove(others.begin(), others.end(), id), others.end());
+
+		std::vector<int> parts;
+		parts.push_back(id);
+		parts.insert(parts.end(), others.begin(), others.end());
+		if (parts.size() <= 1)
+		{
+			continue;
+		}
+
+		out << newid[locid] << " " << parts.size() << " ";
+		for (const int rank : parts)
+		{
+			out << (rank + 1) << " ";
+		}
+		out << std::endl;
+	}
+}
+
+void CollectPatboundFacesFromSurfaceFile(
+	const std::string &surface_file_path,
+	std::set<FaceKey> &patbound_faces)
+{
+	std::ifstream input(surface_file_path, std::ios::binary);
+	if (!input)
+	{
+		FailStreamOperation("failed to open surface stream file for patbound collection: " + surface_file_path);
+	}
+
+	patbound_faces.clear();
+	FaceRecord record{};
+	while (input.read(reinterpret_cast<char *>(&record), static_cast<std::streamsize>(sizeof(FaceRecord))))
+	{
+		const xdFace face = FromFaceRecord(record);
+		if (face.patbound != 0)
+		{
+			patbound_faces.insert(make_face_key(face.lsvrtx[0], face.lsvrtx[1], face.lsvrtx[2]));
+		}
+	}
+
+	if (!input.eof())
+	{
+		FailStreamOperation("surface stream file is truncated during patbound collection: " + surface_file_path);
+	}
+}
+
+StreamBoundaryHeaderStats WritePartitionBoundaryAndHeaderFromStreams(
+	const StreamMeshView &smv,
+	const std::string &output_path,
+	int numParts,
+	int id,
+	const int *newid,
+	const int *VEgid,
+	const std::map<int, std::list<int>> &adjbarycs)
+{
+	const std::filesystem::path partition_dir =
+		std::filesystem::path(output_path) / ("partitioning." + std::to_string(numParts));
+	std::filesystem::create_directories(partition_dir);
+
+	const std::filesystem::path boundary_path =
+		partition_dir / ("part." + std::to_string(id + 1) + ".boundary");
+	const std::filesystem::path header_path =
+		partition_dir / ("part." + std::to_string(id + 1) + ".header");
+
+	const int np = StreamMesh_GetNP(smv);
+	const int ne = StreamMesh_GetNE(smv);
+	const int nse = StreamMesh_GetNSE(smv);
+
+	Index3 i3;
+	int tet[4];
+	int l;
+	bool (*fn_pt)(Index3, Index3) = fncomp;
+	std::multimap<Index3, int, bool(*)(Index3, Index3)> face2vol(fn_pt);
+
+	for (int i = 1; i <= ne; ++i)
+	{
+		int domidx = 0;
+		StreamMesh_GetVolumeElement(smv, i, tet, domidx);
+		for (int j = 1; j <= 4; ++j)
+		{
+			l = 0;
+			for (int k = 1; k <= 4; ++k)
+			{
+				if (k != j)
+				{
+					i3.x[l] = newid[tet[k - 1]];
+					++l;
+				}
+			}
+			i3.Sort();
+			face2vol.insert(std::make_pair(i3, VEgid[i]));
+		}
+	}
+
+	std::set<FaceKey> patbound_faces;
+	CollectPatboundFacesFromSurfaceFile(smv.surface_file_path, patbound_faces);
+
+	std::ofstream outboundarys(boundary_path);
+	if (!outboundarys)
+	{
+		FailStreamOperation("failed to open partition boundary file: " + boundary_path.string());
+	}
+
+	int number = 0;
+	for (int sid = 1; sid <= nse; ++sid)
+	{
+		int tri[3];
+		int surfidx = 0;
+		StreamMesh_GetSurfaceElement(smv, sid, tri, surfidx);
+
+		const FaceKey fk = make_face_key(tri[0], tri[1], tri[2]);
+		if (patbound_faces.count(fk) != 0)
+		{
+			continue;
+		}
+
+		const int geoid = surfidx + 1;
+		i3.x[0] = newid[tri[0]];
+		i3.x[1] = newid[tri[1]];
+		i3.x[2] = newid[tri[2]];
+		i3.Sort();
+		const auto myit = face2vol.find(i3);
+		if (myit == face2vol.end())
+		{
+			continue;
+		}
+
+		++number;
+		outboundarys << number << " " << geoid << " " << myit->second
+		             << " 0 303 "
+		             << newid[tri[0]] << " "
+		             << newid[tri[1]] << " "
+		             << newid[tri[2]] << std::endl;
+	}
+
+	std::ofstream outheader(header_path);
+	if (!outheader)
+	{
+		FailStreamOperation("failed to open partition header file: " + header_path.string());
+	}
+
+	outheader << np << " " << ne << " " << number << std::endl;
+	outheader << 2 << std::endl;
+	outheader << "504 " << ne << std::endl;
+	outheader << "303 " << number << std::endl;
+	if (!adjbarycs.empty())
+	{
+		outheader << adjbarycs.size() << " 0" << std::endl;
+	}
+
+	StreamBoundaryHeaderStats stats;
+	stats.boundary_count = number;
+	return stats;
+}
+
+StreamMeshQualityStats ComputeMeshQualityFromStreams(const StreamMeshView &smv)
+{
+	StreamMeshQualityStats stats;
+	stats.ne = StreamMesh_GetNE(smv);
+	if (stats.ne == 0)
+	{
+		return stats;
+	}
+
+	double sum_volume = 0.0;
+	stats.min_volume = std::numeric_limits<double>::max();
+	stats.max_volume = 0.0;
+
+	for (int i = 1; i <= stats.ne; ++i)
+	{
+		int tet[4];
+		int domidx = 0;
+		double p0[3];
+		double p1[3];
+		double p2[3];
+		double p3[3];
+		StreamMesh_GetVolumeElement(smv, i, tet, domidx);
+		StreamMesh_GetPoint(smv, tet[0], p0);
+		StreamMesh_GetPoint(smv, tet[1], p1);
+		StreamMesh_GetPoint(smv, tet[2], p2);
+		StreamMesh_GetPoint(smv, tet[3], p3);
+
+		const double volume = TetVolumeFromPoints(p0, p1, p2, p3);
+		if (volume < stats.min_volume)
+		{
+			stats.min_volume = volume;
+		}
+		if (volume > stats.max_volume)
+		{
+			stats.max_volume = volume;
+		}
+		sum_volume += volume;
+	}
+
+	stats.avg_volume = sum_volume / static_cast<double>(stats.ne);
+	return stats;
+}
+
+void WriteMeshQualityFromStreams(
+	const std::string &output_path,
+	int id,
+	const StreamMeshQualityStats &stats)
+{
+	const std::filesystem::path meshquality_dir =
+		std::filesystem::path(output_path) / "meshQuality";
+	std::filesystem::create_directories(meshquality_dir);
+
+	const std::filesystem::path filepath =
+		meshquality_dir / ("meshQuality" + std::to_string(id) + ".txt");
+	std::ofstream output(filepath);
+	if (!output)
+	{
+		FailStreamOperation("failed to open meshQuality file: " + filepath.string());
+	}
+
+	output << std::setprecision(17);
+	output << "ne=" << stats.ne << "\n";
+	output << "min_volume=" << stats.min_volume << "\n";
+	output << "max_volume=" << stats.max_volume << "\n";
+	output << "avg_volume=" << stats.avg_volume << "\n";
+}
+
+void com_baryVolumeElements_from_streams(
+	const StreamMeshView &smv,
+	MPI_Comm comm,
+	const std::map<int, std::list<int>> &adjbarycs,
+	const int *newid,
+	const int *VEgid,
+	int numprocs,
+	int mypid,
+	StreamVolWithAdjData &out_data)
+{
+	out_data.points.clear();
+	out_data.point_global_ids.clear();
+	out_data.local_tets.clear();
+	out_data.ghost_tets.clear();
+	out_data.surfaces.clear();
+
+	const int np = StreamMesh_GetNP(smv);
+	const int ne = StreamMesh_GetNE(smv);
+
+	out_data.points.reserve(np);
+	out_data.point_global_ids.reserve(np);
+	out_data.local_tets.reserve(ne);
+
+	for (int pid = 1; pid <= np; ++pid)
+	{
+		PointCoordRecord point{};
+		StreamMesh_GetPoint(smv, pid, point.xyz);
+		out_data.points.push_back(point);
+		out_data.point_global_ids.push_back(newid[pid]);
+	}
+
+	std::map<int, std::vector<StreamGhostVE>> send_map;
+	for (int eid = 1; eid <= ne; ++eid)
+	{
+		int tet[4];
+		int domidx = 0;
+		StreamMesh_GetVolumeElement(smv, eid, tet, domidx);
+
+		TetRecord local_record{};
+		for (int k = 0; k < 4; ++k)
+		{
+			local_record.vids[k] = newid[tet[k]];
+		}
+		local_record.domidx = domidx;
+		out_data.local_tets.push_back(local_record);
+
+		std::map<int, int> num_adj_points;
+		for (int k = 0; k < 4; ++k)
+		{
+			const auto ib = adjbarycs.find(tet[k]);
+			if (ib == adjbarycs.end())
+			{
+				continue;
+			}
+			for (const int pid : ib->second)
+			{
+				num_adj_points[pid]++;
+			}
+		}
+
+		std::set<int> pid_tmp;
+		for (const auto &entry : num_adj_points)
+		{
+			if (entry.second >= 3)
+			{
+				pid_tmp.insert(entry.first);
+			}
+		}
+
+		if (pid_tmp.empty())
+		{
+			continue;
+		}
+
+		StreamGhostVE ve{};
+		ve.gid = VEgid[eid];
+		ve.domidx = domidx;
+		for (int k = 0; k < 4; ++k)
+		{
+			ve.pindex[k] = newid[tet[k]];
+			StreamMesh_GetPoint(smv, tet[k], ve.xyz[k]);
+		}
+
+		for (const int dst : pid_tmp)
+		{
+			send_map[dst].push_back(ve);
+		}
+	}
+
+	std::vector<int> send_counts(numprocs, 0);
+	for (const auto &entry : send_map)
+	{
+		if (entry.first >= 0 && entry.first < numprocs)
+		{
+			send_counts[entry.first] = static_cast<int>(entry.second.size());
+		}
+	}
+
+	std::vector<int> recv_counts(numprocs, 0);
+	MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, comm);
+
+	std::vector<int> send_displs(numprocs, 0);
+	std::vector<int> recv_displs(numprocs, 0);
+	int total_send = 0;
+	int total_recv = 0;
+	for (int rank = 0; rank < numprocs; ++rank)
+	{
+		send_displs[rank] = total_send;
+		recv_displs[rank] = total_recv;
+		total_send += send_counts[rank];
+		total_recv += recv_counts[rank];
+	}
+
+	std::vector<StreamGhostVE> send_buffer;
+	send_buffer.reserve(total_send);
+	for (int rank = 0; rank < numprocs; ++rank)
+	{
+		const auto it = send_map.find(rank);
+		if (it != send_map.end())
+		{
+			send_buffer.insert(send_buffer.end(), it->second.begin(), it->second.end());
+		}
+	}
+
+	std::vector<StreamGhostVE> recv_buffer(static_cast<std::size_t>(total_recv));
+	MPI_Datatype ghost_ve_type = CreateMpiGhostVeType();
+	MPI_Alltoallv(
+		send_buffer.empty() ? nullptr : send_buffer.data(),
+		send_counts.data(),
+		send_displs.data(),
+		ghost_ve_type,
+		recv_buffer.empty() ? nullptr : recv_buffer.data(),
+		recv_counts.data(),
+		recv_displs.data(),
+		ghost_ve_type,
+		comm);
+	MPI_Type_free(&ghost_ve_type);
+
+	std::map<int, int> global_pid_to_local_writer_index;
+	for (std::size_t i = 0; i < out_data.point_global_ids.size(); ++i)
+	{
+		global_pid_to_local_writer_index[out_data.point_global_ids[i]] = static_cast<int>(i + 1);
+	}
+
+	out_data.ghost_tets.reserve(recv_buffer.size());
+	for (const StreamGhostVE &ve : recv_buffer)
+	{
+		TetRecord ghost_record{};
+		ghost_record.domidx = ve.domidx;
+		for (int k = 0; k < 4; ++k)
+		{
+			auto it = global_pid_to_local_writer_index.find(ve.pindex[k]);
+			if (it == global_pid_to_local_writer_index.end())
+			{
+				PointCoordRecord point{};
+				point.xyz[0] = ve.xyz[k][0];
+				point.xyz[1] = ve.xyz[k][1];
+				point.xyz[2] = ve.xyz[k][2];
+				out_data.points.push_back(point);
+				out_data.point_global_ids.push_back(ve.pindex[k]);
+				const int new_index = static_cast<int>(out_data.point_global_ids.size());
+				global_pid_to_local_writer_index[ve.pindex[k]] = new_index;
+				ghost_record.vids[k] = ve.pindex[k];
+			}
+			else
+			{
+				ghost_record.vids[k] = ve.pindex[k];
+			}
+		}
+		out_data.ghost_tets.push_back(ghost_record);
+	}
+
+	std::ifstream surface_input(smv.surface_file_path, std::ios::binary);
+	if (!surface_input)
+	{
+		FailStreamOperation("failed to open surface stream file for volwithadj: " + smv.surface_file_path);
+	}
+	FaceRecord face_record{};
+	while (surface_input.read(reinterpret_cast<char *>(&face_record), static_cast<std::streamsize>(sizeof(FaceRecord))))
+	{
+		out_data.surfaces.push_back(face_record);
+	}
+	if (!surface_input.eof())
+	{
+		FailStreamOperation("surface stream file is truncated while building volwithadj data: " + smv.surface_file_path);
+	}
+}
+
+void WriteVolWithAdjFromStreams(const std::string &output_path,
+	int id,
+	const StreamVolWithAdjData &data)
+{
+	const std::filesystem::path out_path =
+		std::filesystem::path(output_path) / "volwithadj" / ("volwithadj" + std::to_string(id) + ".vol");
+	EnsureParentDirectory(out_path.string());
+	std::ofstream output(out_path, std::ios::trunc);
+	if (!output)
+	{
+		FailStreamOperation("failed to open volwithadj output file: " + out_path.string());
+	}
+
+	std::map<int, int> writer_index_by_global_id;
+	for (std::size_t i = 0; i < data.point_global_ids.size(); ++i)
+	{
+		writer_index_by_global_id[data.point_global_ids[i]] = static_cast<int>(i + 1);
+	}
+
+	int max_geoboundary = 0;
+	for (const FaceRecord &record : data.surfaces)
+	{
+		max_geoboundary = std::max(max_geoboundary, std::max(record.geoboundary, 1));
+	}
+
+	output << "# Generated by NETGEN stream volwithadj writer\n\n";
+	output << "mesh3d\n";
+	output << "dimension\n3\n";
+	output << "geomtype\n0\n\n";
+	output << "# surfnr\tdomin\tdomout\ttlosurf\tbcprop\n";
+	output << "facedescriptors\n";
+	output << max_geoboundary << "\n";
+	for (int descriptor = 1; descriptor <= max_geoboundary; ++descriptor)
+	{
+		output << descriptor << " 1 0 " << descriptor << " " << descriptor << "\n";
+	}
+
+	output << "surfaceelements\n";
+	output << data.surfaces.size() << "\n";
+	for (const FaceRecord &record : data.surfaces)
+	{
+		const int descriptor = std::max(record.geoboundary, 1);
+		const int g0 = data.point_global_ids.at(static_cast<std::size_t>(record.lsvrtx[0] - 1));
+		const int g1 = data.point_global_ids.at(static_cast<std::size_t>(record.lsvrtx[1] - 1));
+		const int g2 = data.point_global_ids.at(static_cast<std::size_t>(record.lsvrtx[2] - 1));
+		output << " " << descriptor << " 1 1 0 3 "
+		       << writer_index_by_global_id[g0] << " "
+		       << writer_index_by_global_id[g1] << " "
+		       << writer_index_by_global_id[g2] << "\n";
+	}
+
+	output << "volumeelements\n";
+	output << (data.local_tets.size() + data.ghost_tets.size()) << "\n";
+	auto write_tet = [&](const TetRecord &record) {
+		output << record.domidx << " 4 "
+		       << writer_index_by_global_id.at(record.vids[0]) << " "
+		       << writer_index_by_global_id.at(record.vids[1]) << " "
+		       << writer_index_by_global_id.at(record.vids[2]) << " "
+		       << writer_index_by_global_id.at(record.vids[3]) << "\n";
+	};
+	for (const TetRecord &record : data.local_tets)
+	{
+		write_tet(record);
+	}
+	for (const TetRecord &record : data.ghost_tets)
+	{
+		write_tet(record);
+	}
+
+	output << "points\n";
+	output << data.points.size() << "\n";
+	output << std::setprecision(std::numeric_limits<double>::max_digits10);
+	for (const PointCoordRecord &point : data.points)
+	{
+		output << point.xyz[0] << " " << point.xyz[1] << " " << point.xyz[2] << "\n";
+	}
+
+	output << "endmesh\n";
 }
 
 bool WriteVolFromStreams(const std::string &point_table_path,
@@ -2757,6 +3821,47 @@ void computeadj(
 			}
 		}
 	}
+}
+
+void DumpAdjBarycsSummary(
+	const std::string &filepath,
+	int mypid,
+	const std::map<Barycvrtx, std::list<int>, CompBarycvrtx> &barycvrtx2adjprocsmap)
+{
+	std::ofstream output(filepath, std::ios::app);
+	if (!output)
+	{
+		FailStreamOperation("failed to open adjacency summary file: " + filepath);
+	}
+
+	output << "rank=" << mypid << "\n";
+	output << "adj_entry_count=" << barycvrtx2adjprocsmap.size() << "\n";
+
+	int item_index = 0;
+	for (const auto &entry : barycvrtx2adjprocsmap)
+	{
+		if (item_index >= 10)
+		{
+			break;
+		}
+		output << "item" << item_index << "="
+		       << entry.first.gvrtx[0] << ","
+		       << entry.first.gvrtx[1] << ","
+		       << entry.first.gvrtx[2] << " -> ";
+		bool first_pid = true;
+		for (const int pid : entry.second)
+		{
+			if (!first_pid)
+			{
+				output << ",";
+			}
+			output << pid;
+			first_pid = false;
+		}
+		output << "\n";
+		++item_index;
+	}
+	output << "\n";
 }
 
 int *com_barycoords(
