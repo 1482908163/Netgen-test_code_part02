@@ -1909,6 +1909,282 @@ void WriteMeshQualityFromStreams(
 	output << "avg_volume=" << stats.avg_volume << "\n";
 }
 
+static void LookupVolAdjPointXYZ(const StreamVolWithAdjData &data,
+	const int *newid,
+	int global_pid,
+	double xyz[3])
+{
+	if (data.smv == nullptr)
+	{
+		FailStreamOperation("volwithadj lookup requested without stream mesh view");
+	}
+
+	static const StreamMeshView *cached_smv = nullptr;
+	static const int *cached_newid = nullptr;
+	static std::map<int, int> cached_local_pid_by_global_pid;
+	if (cached_smv != data.smv || cached_newid != newid)
+	{
+		cached_local_pid_by_global_pid.clear();
+		const int np = StreamMesh_GetNP(*data.smv);
+		for (int pid = 1; pid <= np; ++pid)
+		{
+			if (newid[pid] > 0)
+			{
+				cached_local_pid_by_global_pid[newid[pid]] = pid;
+			}
+		}
+		cached_smv = data.smv;
+		cached_newid = newid;
+	}
+
+	const auto local_it = cached_local_pid_by_global_pid.find(global_pid);
+	if (local_it != cached_local_pid_by_global_pid.end())
+	{
+		StreamMesh_GetPoint(*data.smv, local_it->second, xyz);
+		return;
+	}
+
+	const auto ghost_it = data.ghost_global_pid_to_index.find(global_pid);
+	if (ghost_it != data.ghost_global_pid_to_index.end())
+	{
+		const PointCoordRecord &point = data.ghost_points.at(static_cast<std::size_t>(ghost_it->second));
+		xyz[0] = point.xyz[0];
+		xyz[1] = point.xyz[1];
+		xyz[2] = point.xyz[2];
+		return;
+	}
+
+	FailStreamOperation("failed to locate point for volwithadj global point id: " + std::to_string(global_pid));
+}
+
+StreamFullMeshQualityStats ComputeFullMeshQualityFromVolWithAdjStreams(
+	const StreamVolWithAdjData &data,
+	const int *newid)
+{
+	if (data.smv == nullptr)
+	{
+		FailStreamOperation("full meshQuality requested without stream mesh view");
+	}
+
+	const StreamMeshView &smv = *data.smv;
+	StreamFullMeshQualityStats stats;
+	stats.np = StreamMesh_GetNP(smv) + static_cast<int>(data.ghost_points.size());
+	stats.nse = StreamMesh_GetNSE(smv);
+	stats.ne = StreamMesh_GetNE(smv) + static_cast<int>(data.ghost_tets.size());
+	stats.triangle_length_width_ratio_min = 0x3f3f3f;
+	stats.triangle_skew_min = 0x3f3f3f;
+	stats.tetrahedrons_length_width_ratio_min = 0x3f3f3f;
+	stats.tetrahedrons_skew_min = 0x3f3f3f;
+	stats.min_volume = std::numeric_limits<double>::max();
+
+	std::ifstream surface_input(smv.surface_file_path, std::ios::binary);
+	if (!surface_input)
+	{
+		FailStreamOperation("failed to open surface stream file for full meshQuality: " + smv.surface_file_path);
+	}
+	std::vector<FaceRecord> face_buffer;
+	while (ReadFaceBatch(surface_input, face_buffer, kDefaultStreamBatch) > 0)
+	{
+		for (const FaceRecord &record : face_buffer)
+		{
+			const xdFace face = FromFaceRecord(record);
+			double xyz[3][3];
+			for (int k = 0; k < 3; ++k)
+			{
+				StreamMesh_GetPoint(smv, face.lsvrtx[k], xyz[k]);
+			}
+
+			const double lwr = length_width_ratio(xyz);
+			Record_LWR_count(lwr, stats.aspect_ratio_count);
+			stats.triangle_length_width_ratio_sum += lwr;
+			stats.triangle_length_width_ratio_min = (std::min)(stats.triangle_length_width_ratio_min, lwr);
+			stats.triangle_length_width_ratio_max = (std::max)(stats.triangle_length_width_ratio_max, lwr);
+
+			const double min_ia = min_internal_angle(xyz);
+			const double max_ia = max_internal_angle(xyz);
+			stats.triangle_internal_angle_min = min_ia;
+			stats.triangle_internal_angle_max = max_ia;
+
+			const double tris = triangle_skew(xyz);
+			stats.triangle_skew_sum += tris;
+			stats.triangle_skew_min = (std::min)(stats.triangle_skew_min, tris);
+			stats.triangle_skew_max = (std::max)(stats.triangle_skew_max, tris);
+		}
+	}
+
+	auto update_tet_quality = [&](const double Vxyz[4][3]) {
+		const double vlwr = tetrahedrons_length_width_ratio(Vxyz);
+		stats.tetrahedrons_length_width_ratio_sum += vlwr;
+		stats.tetrahedrons_length_width_ratio_min = (std::min)(stats.tetrahedrons_length_width_ratio_min, vlwr);
+		stats.tetrahedrons_length_width_ratio_max = (std::max)(stats.tetrahedrons_length_width_ratio_max, vlwr);
+
+		const double vtris = tetrahedrons_skew(const_cast<double (*)[3]>(Vxyz));
+		stats.tetrahedrons_skew_sum += vtris;
+		stats.tetrahedrons_skew_min = (std::min)(stats.tetrahedrons_skew_min, vtris);
+		stats.tetrahedrons_skew_max = (std::max)(stats.tetrahedrons_skew_max, vtris);
+
+		double face_xyz[4][3][3];
+		const int u[4][3] = {
+			{0, 1, 2},
+			{0, 1, 3},
+			{0, 2, 3},
+			{1, 2, 3},
+		};
+		for (int k = 0; k < 4; ++k)
+		{
+			for (int j = 0; j < 3; ++j)
+			{
+				face_xyz[k][j][0] = Vxyz[u[k][j]][0];
+				face_xyz[k][j][1] = Vxyz[u[k][j]][1];
+				face_xyz[k][j][2] = Vxyz[u[k][j]][2];
+			}
+		}
+		double face_VMinIA[4];
+		double face_VMaxIA[4];
+		for (int k = 0; k < 4; ++k)
+		{
+			face_VMinIA[k] = min_internal_angle(face_xyz[k]);
+			face_VMaxIA[k] = max_internal_angle(face_xyz[k]);
+		}
+		stats.tetrahedrons_internal_angle_min =
+			(std::min)({face_VMinIA[0], face_VMinIA[1], face_VMinIA[2], face_VMinIA[3]});
+		stats.tetrahedrons_internal_angle_max =
+			(std::max)({face_VMaxIA[0], face_VMaxIA[1], face_VMaxIA[2], face_VMaxIA[3]});
+
+		const double volume = TetVolumeFromPoints(Vxyz[0], Vxyz[1], Vxyz[2], Vxyz[3]);
+		stats.min_volume = (std::min)(stats.min_volume, volume);
+		stats.max_volume = (std::max)(stats.max_volume, volume);
+		stats.volume_sum += volume;
+	};
+
+	std::ifstream tet_input(smv.tet_file_path, std::ios::binary);
+	if (!tet_input)
+	{
+		FailStreamOperation("failed to open tet stream file for full meshQuality: " + smv.tet_file_path);
+	}
+	std::vector<TetRecord> tet_buffer;
+	while (ReadTetBatch(tet_input, tet_buffer, kDefaultStreamBatch) > 0)
+	{
+		for (const TetRecord &record : tet_buffer)
+		{
+			int tet[4];
+			int domidx = 0;
+			double Vxyz[4][3];
+			FromTetRecord(record, tet, domidx);
+			for (int k = 0; k < 4; ++k)
+			{
+				StreamMesh_GetPoint(smv, tet[k], Vxyz[k]);
+			}
+			update_tet_quality(Vxyz);
+		}
+	}
+
+	for (const StreamGhostTetRecord &record : data.ghost_tets)
+	{
+		double Vxyz[4][3];
+		for (int k = 0; k < 4; ++k)
+		{
+			LookupVolAdjPointXYZ(data, newid, record.global_vids[k], Vxyz[k]);
+		}
+		update_tet_quality(Vxyz);
+	}
+
+	if (stats.nse == 0)
+	{
+		stats.triangle_length_width_ratio_min = 0.0;
+		stats.triangle_skew_min = 0.0;
+	}
+	if (stats.ne == 0)
+	{
+		stats.tetrahedrons_length_width_ratio_min = 0.0;
+		stats.tetrahedrons_skew_min = 0.0;
+		stats.min_volume = 0.0;
+	}
+
+	return stats;
+}
+
+void WriteFullMeshQualityFromVolWithAdjStreams(
+	const std::string &output_path,
+	int id,
+	const StreamFullMeshQualityStats &stats,
+	MPI_Comm comm)
+{
+	const std::filesystem::path meshquality_dir =
+		std::filesystem::path(output_path) / "meshQuality";
+	std::filesystem::create_directories(meshquality_dir);
+
+	int global_aspect_ratio_count[6] = {0, 0, 0, 0, 0, 0};
+	MPI_Reduce(
+		const_cast<int *>(stats.aspect_ratio_count),
+		global_aspect_ratio_count,
+		6,
+		MPI_INT,
+		MPI_SUM,
+		0,
+		comm);
+
+	if (id == 0)
+	{
+		const std::filesystem::path summary_path = meshquality_dir / "meshQuality.txt";
+		FILE *summary_fp = std::fopen(summary_path.string().c_str(), "w");
+		if (summary_fp == NULL)
+		{
+			FailStreamOperation("failed to open meshQuality summary file: " + summary_path.string());
+		}
+		int sum_count_surface = 0;
+		for (int i = 0; i < 6; ++i)
+		{
+			sum_count_surface += global_aspect_ratio_count[i];
+		}
+		const double denom = (sum_count_surface == 0) ? 1.0 : static_cast<double>(sum_count_surface);
+		fprintf(summary_fp, "Sum_Aspect_Ratio(1-1.5): %f \r\n", global_aspect_ratio_count[0] / denom);
+		fprintf(summary_fp, "Sum_Aspect_Ratio(1.5-2): %f \r\n", global_aspect_ratio_count[1] / denom);
+		fprintf(summary_fp, "Sum_Aspect_Ratio(2-3): %f \r\n", global_aspect_ratio_count[2] / denom);
+		fprintf(summary_fp, "Sum_Aspect_Ratio(3-4): %f \r\n", global_aspect_ratio_count[3] / denom);
+		fprintf(summary_fp, "Sum_Aspect_Ratio(4-5): %f \r\n", global_aspect_ratio_count[4] / denom);
+		fprintf(summary_fp, "Sum_Aspect_Ratio(5-6): %f \r\n", global_aspect_ratio_count[5] / denom);
+		std::fclose(summary_fp);
+	}
+
+	const std::filesystem::path rank_path =
+		meshquality_dir / ("meshQuality" + std::to_string(id) + ".txt");
+	FILE *fp = std::fopen(rank_path.string().c_str(), "w");
+	if (fp == NULL)
+	{
+		FailStreamOperation("failed to open rank meshQuality file: " + rank_path.string());
+	}
+
+	const double nse_denom = (stats.nse == 0) ? 1.0 : static_cast<double>(stats.nse);
+	const double ne_denom = (stats.ne == 0) ? 1.0 : static_cast<double>(stats.ne);
+	fprintf(fp, "Point_Num: %d SurfEle_Num: %d SoildEle_Num: %d \r\n", stats.np, stats.nse, stats.ne);
+	fprintf(fp, "\r\n");
+	fprintf(fp, "triangle_length_width_ratio_min: %f \r\n", stats.triangle_length_width_ratio_min);
+	fprintf(fp, "triangle_length_width_ratio_max: %f \r\n", stats.triangle_length_width_ratio_max);
+	fprintf(fp, "triangle_length_width_ratio_mean: %f \r\n", stats.triangle_length_width_ratio_sum / nse_denom);
+	fprintf(fp, "Aspect_Ratio(1-1.5): %d \r\n", stats.aspect_ratio_count[0]);
+	fprintf(fp, "Aspect_Ratio(1.5-2): %d \r\n", stats.aspect_ratio_count[1]);
+	fprintf(fp, "Aspect_Ratio(2-3): %d \r\n", stats.aspect_ratio_count[2]);
+	fprintf(fp, "Aspect_Ratio(3-4): %d \r\n", stats.aspect_ratio_count[3]);
+	fprintf(fp, "Aspect_Ratio(4-5): %d \r\n", stats.aspect_ratio_count[4]);
+	fprintf(fp, "Aspect_Ratio(5-6): %d \r\n", stats.aspect_ratio_count[5]);
+	fprintf(fp, "triangle_skew_min: %f \r\n", stats.triangle_skew_min);
+	fprintf(fp, "triangle_skew_max: %f \r\n", stats.triangle_skew_max);
+	fprintf(fp, "triangle_skew_mean: %f \r\n", stats.triangle_skew_sum / nse_denom);
+	fprintf(fp, "triangle_internal_angle_min: %f \r\n", stats.triangle_internal_angle_min);
+	fprintf(fp, "triangle_internal_angle_max: %f \r(n", stats.triangle_internal_angle_max);
+	fprintf(fp, "\r\n");
+	fprintf(fp, "tetrahedrons_length_width_ratio_min: %f \r\n", stats.tetrahedrons_length_width_ratio_min);
+	fprintf(fp, "tetrahedrons_length_width_ratio_max: %f \r\n", stats.tetrahedrons_length_width_ratio_max);
+	fprintf(fp, "tetrahedrons_length_width_ratio_mean: %f \r\n", stats.tetrahedrons_length_width_ratio_sum / ne_denom);
+	fprintf(fp, "tetrahedrons_skew_min: %f \r\n", stats.tetrahedrons_skew_min);
+	fprintf(fp, "tetrahedrons_skew_max: %f \r\n", stats.tetrahedrons_skew_max);
+	fprintf(fp, "tetrahedrons_skew_mean: %f \r\n", stats.tetrahedrons_skew_sum / ne_denom);
+	fprintf(fp, "tetrahedrons_internal_angle_min: %f \r\n", stats.tetrahedrons_internal_angle_min);
+	fprintf(fp, "tetrahedrons_internal_angle_max: %f \r\n", stats.tetrahedrons_internal_angle_max);
+	std::fclose(fp);
+}
+
 void com_baryVolumeElements_from_streams(
 	const StreamMeshView &smv,
 	MPI_Comm comm,
@@ -1919,25 +2195,21 @@ void com_baryVolumeElements_from_streams(
 	int mypid,
 	StreamVolWithAdjData &out_data)
 {
-	out_data.points.clear();
-	out_data.point_global_ids.clear();
-	out_data.local_tets.clear();
+	out_data.smv = &smv;
 	out_data.ghost_tets.clear();
-	out_data.surfaces.clear();
+	out_data.ghost_point_global_ids.clear();
+	out_data.ghost_points.clear();
+	out_data.ghost_global_pid_to_index.clear();
 
 	const int np = StreamMesh_GetNP(smv);
 	const int ne = StreamMesh_GetNE(smv);
-
-	out_data.points.reserve(np);
-	out_data.point_global_ids.reserve(np);
-	out_data.local_tets.reserve(ne);
-
+	std::map<int, int> local_global_pid_to_local_pid;
 	for (int pid = 1; pid <= np; ++pid)
 	{
-		PointCoordRecord point{};
-		StreamMesh_GetPoint(smv, pid, point.xyz);
-		out_data.points.push_back(point);
-		out_data.point_global_ids.push_back(newid[pid]);
+		if (newid[pid] > 0)
+		{
+			local_global_pid_to_local_pid[newid[pid]] = pid;
+		}
 	}
 
 	std::map<int, std::vector<StreamGhostVE>> send_map;
@@ -1946,14 +2218,6 @@ void com_baryVolumeElements_from_streams(
 		int tet[4];
 		int domidx = 0;
 		StreamMesh_GetVolumeElement(smv, eid, tet, domidx);
-
-		TetRecord local_record{};
-		for (int k = 0; k < 4; ++k)
-		{
-			local_record.vids[k] = newid[tet[k]];
-		}
-		local_record.domidx = domidx;
-		out_data.local_tets.push_back(local_record);
 
 		std::map<int, int> num_adj_points;
 		for (int k = 0; k < 4; ++k)
@@ -2047,60 +2311,49 @@ void com_baryVolumeElements_from_streams(
 		comm);
 	MPI_Type_free(&ghost_ve_type);
 
-	std::map<int, int> global_pid_to_local_writer_index;
-	for (std::size_t i = 0; i < out_data.point_global_ids.size(); ++i)
-	{
-		global_pid_to_local_writer_index[out_data.point_global_ids[i]] = static_cast<int>(i + 1);
-	}
-
 	out_data.ghost_tets.reserve(recv_buffer.size());
 	for (const StreamGhostVE &ve : recv_buffer)
 	{
-		TetRecord ghost_record{};
+		StreamGhostTetRecord ghost_record{};
+		ghost_record.gid = ve.gid;
 		ghost_record.domidx = ve.domidx;
 		for (int k = 0; k < 4; ++k)
 		{
-			auto it = global_pid_to_local_writer_index.find(ve.pindex[k]);
-			if (it == global_pid_to_local_writer_index.end())
+			ghost_record.global_vids[k] = ve.pindex[k];
+			if (local_global_pid_to_local_pid.find(ve.pindex[k]) != local_global_pid_to_local_pid.end())
+			{
+				continue;
+			}
+			if (out_data.ghost_global_pid_to_index.find(ve.pindex[k]) == out_data.ghost_global_pid_to_index.end())
 			{
 				PointCoordRecord point{};
 				point.xyz[0] = ve.xyz[k][0];
 				point.xyz[1] = ve.xyz[k][1];
 				point.xyz[2] = ve.xyz[k][2];
-				out_data.points.push_back(point);
-				out_data.point_global_ids.push_back(ve.pindex[k]);
-				const int new_index = static_cast<int>(out_data.point_global_ids.size());
-				global_pid_to_local_writer_index[ve.pindex[k]] = new_index;
-				ghost_record.vids[k] = ve.pindex[k];
-			}
-			else
-			{
-				ghost_record.vids[k] = ve.pindex[k];
+				out_data.ghost_point_global_ids.push_back(ve.pindex[k]);
+				out_data.ghost_points.push_back(point);
+				out_data.ghost_global_pid_to_index[ve.pindex[k]] =
+					static_cast<int>(out_data.ghost_points.size() - 1);
 			}
 		}
 		out_data.ghost_tets.push_back(ghost_record);
-	}
-
-	std::ifstream surface_input(smv.surface_file_path, std::ios::binary);
-	if (!surface_input)
-	{
-		FailStreamOperation("failed to open surface stream file for volwithadj: " + smv.surface_file_path);
-	}
-	FaceRecord face_record{};
-	while (surface_input.read(reinterpret_cast<char *>(&face_record), static_cast<std::streamsize>(sizeof(FaceRecord))))
-	{
-		out_data.surfaces.push_back(face_record);
-	}
-	if (!surface_input.eof())
-	{
-		FailStreamOperation("surface stream file is truncated while building volwithadj data: " + smv.surface_file_path);
 	}
 }
 
 void WriteVolWithAdjFromStreams(const std::string &output_path,
 	int id,
-	const StreamVolWithAdjData &data)
+	const StreamVolWithAdjData &data,
+	const int *newid)
 {
+	if (data.smv == nullptr)
+	{
+		FailStreamOperation("volwithadj write requested without stream mesh view");
+	}
+
+	const StreamMeshView &smv = *data.smv;
+	const int local_np = StreamMesh_GetNP(smv);
+	const int local_ne = StreamMesh_GetNE(smv);
+	const int nse = StreamMesh_GetNSE(smv);
 	const std::filesystem::path out_path =
 		std::filesystem::path(output_path) / "volwithadj" / ("volwithadj" + std::to_string(id) + ".vol");
 	EnsureParentDirectory(out_path.string());
@@ -2111,15 +2364,28 @@ void WriteVolWithAdjFromStreams(const std::string &output_path,
 	}
 
 	std::map<int, int> writer_index_by_global_id;
-	for (std::size_t i = 0; i < data.point_global_ids.size(); ++i)
+	for (int pid = 1; pid <= local_np; ++pid)
 	{
-		writer_index_by_global_id[data.point_global_ids[i]] = static_cast<int>(i + 1);
+		writer_index_by_global_id[newid[pid]] = pid;
+	}
+	for (std::size_t i = 0; i < data.ghost_point_global_ids.size(); ++i)
+	{
+		writer_index_by_global_id[data.ghost_point_global_ids[i]] = local_np + static_cast<int>(i) + 1;
 	}
 
-	int max_geoboundary = 0;
-	for (const FaceRecord &record : data.surfaces)
+	std::ifstream surface_scan(smv.surface_file_path, std::ios::binary);
+	if (!surface_scan)
 	{
-		max_geoboundary = std::max(max_geoboundary, std::max(record.geoboundary, 1));
+		FailStreamOperation("failed to open surface stream file for volwithadj descriptors: " + smv.surface_file_path);
+	}
+	std::vector<FaceRecord> face_buffer;
+	int max_geoboundary = 0;
+	while (ReadFaceBatch(surface_scan, face_buffer, kDefaultStreamBatch) > 0)
+	{
+		for (const FaceRecord &record : face_buffer)
+		{
+			max_geoboundary = std::max(max_geoboundary, std::max(record.geoboundary, 1));
+		}
 	}
 
 	output << "# Generated by NETGEN stream volwithadj writer\n\n";
@@ -2135,41 +2401,65 @@ void WriteVolWithAdjFromStreams(const std::string &output_path,
 	}
 
 	output << "surfaceelements\n";
-	output << data.surfaces.size() << "\n";
-	for (const FaceRecord &record : data.surfaces)
+	output << nse << "\n";
+	std::ifstream surface_input(smv.surface_file_path, std::ios::binary);
+	if (!surface_input)
 	{
-		const int descriptor = std::max(record.geoboundary, 1);
-		const int g0 = data.point_global_ids.at(static_cast<std::size_t>(record.lsvrtx[0] - 1));
-		const int g1 = data.point_global_ids.at(static_cast<std::size_t>(record.lsvrtx[1] - 1));
-		const int g2 = data.point_global_ids.at(static_cast<std::size_t>(record.lsvrtx[2] - 1));
-		output << " " << descriptor << " 1 1 0 3 "
-		       << writer_index_by_global_id[g0] << " "
-		       << writer_index_by_global_id[g1] << " "
-		       << writer_index_by_global_id[g2] << "\n";
+		FailStreamOperation("failed to open surface stream file for volwithadj write: " + smv.surface_file_path);
+	}
+	while (ReadFaceBatch(surface_input, face_buffer, kDefaultStreamBatch) > 0)
+	{
+		for (const FaceRecord &record : face_buffer)
+		{
+			const int descriptor = std::max(record.geoboundary, 1);
+			output << " " << descriptor << " 1 1 0 3 "
+			       << writer_index_by_global_id.at(newid[record.lsvrtx[0]]) << " "
+			       << writer_index_by_global_id.at(newid[record.lsvrtx[1]]) << " "
+			       << writer_index_by_global_id.at(newid[record.lsvrtx[2]]) << "\n";
+		}
 	}
 
 	output << "volumeelements\n";
-	output << (data.local_tets.size() + data.ghost_tets.size()) << "\n";
-	auto write_tet = [&](const TetRecord &record) {
-		output << record.domidx << " 4 "
-		       << writer_index_by_global_id.at(record.vids[0]) << " "
-		       << writer_index_by_global_id.at(record.vids[1]) << " "
-		       << writer_index_by_global_id.at(record.vids[2]) << " "
-		       << writer_index_by_global_id.at(record.vids[3]) << "\n";
-	};
-	for (const TetRecord &record : data.local_tets)
+	output << (local_ne + static_cast<int>(data.ghost_tets.size())) << "\n";
+	std::ifstream tet_input(smv.tet_file_path, std::ios::binary);
+	if (!tet_input)
 	{
-		write_tet(record);
+		FailStreamOperation("failed to open tet stream file for volwithadj write: " + smv.tet_file_path);
 	}
-	for (const TetRecord &record : data.ghost_tets)
+	std::vector<TetRecord> tet_buffer;
+	while (ReadTetBatch(tet_input, tet_buffer, kDefaultStreamBatch) > 0)
 	{
-		write_tet(record);
+		for (const TetRecord &record : tet_buffer)
+		{
+			int tet[4];
+			int domidx = 0;
+			FromTetRecord(record, tet, domidx);
+			output << domidx << " 4 "
+			       << writer_index_by_global_id.at(newid[tet[0]]) << " "
+			       << writer_index_by_global_id.at(newid[tet[1]]) << " "
+			       << writer_index_by_global_id.at(newid[tet[2]]) << " "
+			       << writer_index_by_global_id.at(newid[tet[3]]) << "\n";
+		}
+	}
+	for (const StreamGhostTetRecord &record : data.ghost_tets)
+	{
+		output << record.domidx << " 4 "
+		       << writer_index_by_global_id.at(record.global_vids[0]) << " "
+		       << writer_index_by_global_id.at(record.global_vids[1]) << " "
+		       << writer_index_by_global_id.at(record.global_vids[2]) << " "
+		       << writer_index_by_global_id.at(record.global_vids[3]) << "\n";
 	}
 
 	output << "points\n";
-	output << data.points.size() << "\n";
+	output << (local_np + static_cast<int>(data.ghost_points.size())) << "\n";
 	output << std::setprecision(std::numeric_limits<double>::max_digits10);
-	for (const PointCoordRecord &point : data.points)
+	for (int pid = 1; pid <= local_np; ++pid)
+	{
+		double xyz[3];
+		StreamMesh_GetPoint(smv, pid, xyz);
+		output << xyz[0] << " " << xyz[1] << " " << xyz[2] << "\n";
+	}
+	for (const PointCoordRecord &point : data.ghost_points)
 	{
 		output << point.xyz[0] << " " << point.xyz[1] << " " << point.xyz[2] << "\n";
 	}

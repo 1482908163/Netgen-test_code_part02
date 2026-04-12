@@ -572,6 +572,7 @@ int main(int argc, char **argv) {
 		                StreamMesh_GetVolumeElement(smv, 1, e1_tet, e1_domidx);
 		                const std::string streammesh_dump_path = OUTPUT_PATH + "testout/testout_streammesh.txt";
 		                std::map<Barycvrtx, std::list<int>, CompBarycvrtx> barycvrtx2adjprocsmap_stream;
+		                print_stage_mem("before computeadj(file_only)", id);
 		                computeadj(id, facemap, g2lvrtxmap, barycvrtx2adjprocsmap_stream);
 		                if(barycvrtx2adjprocsmap_stream.empty()) {
 		                    std::cout << "[STREAM-WARN] computeadj produced empty adjacency map on rank " << id << std::endl;
@@ -590,6 +591,7 @@ int main(int argc, char **argv) {
 		                    numParts,
 		                    VEgid,
 		                    id);
+		                print_stage_mem("after com_barycoords_from_streams", id);
 		                WritePartitionNodesElementsFromStreams(
 		                    smv,
 		                    OUTPUT_PATH,
@@ -612,9 +614,8 @@ int main(int argc, char **argv) {
 		                        newid,
 		                        VEgid,
 		                        adjbarycs_stream);
-		                const StreamMeshQualityStats mq_stats = ComputeMeshQualityFromStreams(smv);
-		                WriteMeshQualityFromStreams(OUTPUT_PATH, id, mq_stats);
 		                StreamVolWithAdjData voladj_data;
+		                print_stage_mem("before com_baryVolumeElements_from_streams", id);
 		                com_baryVolumeElements_from_streams(
 		                    smv,
 		                    MPI_COMM_WORLD,
@@ -624,7 +625,17 @@ int main(int argc, char **argv) {
 		                    numParts,
 		                    id,
 		                    voladj_data);
-		                WriteVolWithAdjFromStreams(OUTPUT_PATH, id, voladj_data);
+		                print_stage_mem("after com_baryVolumeElements_from_streams", id);
+		                const StreamFullMeshQualityStats mq_stats =
+		                    ComputeFullMeshQualityFromVolWithAdjStreams(voladj_data, newid);
+		                print_stage_mem("after ComputeFullMeshQualityFromVolWithAdjStreams", id);
+		                WriteFullMeshQualityFromVolWithAdjStreams(
+		                    OUTPUT_PATH,
+		                    id,
+		                    mq_stats,
+		                    MPI_COMM_WORLD);
+		                WriteVolWithAdjFromStreams(OUTPUT_PATH, id, voladj_data, newid);
+		                print_stage_mem("after WriteVolWithAdjFromStreams", id);
 		                const std::string stream_barycoords_dump_path = OUTPUT_PATH + "testout/testout_stream_barycoords.txt";
 		                const std::string stream_shared_dump_path = OUTPUT_PATH + "testout/testout_stream_shared.txt";
 		                const std::string stream_boundary_dump_path = OUTPUT_PATH + "testout/testout_stream_boundary.txt";
@@ -635,10 +646,10 @@ int main(int argc, char **argv) {
 		                const int first_vegid = (stream_ne >= 1) ? VEgid[1] : 0;
 		                const int local_points = stream_np;
 		                const int local_tets = stream_ne;
-		                const int ghost_added_points = static_cast<int>(voladj_data.points.size()) - local_points;
+		                const int ghost_added_points = static_cast<int>(voladj_data.ghost_points.size());
 		                const int ghost_added_tets = static_cast<int>(voladj_data.ghost_tets.size());
-		                const int final_points = static_cast<int>(voladj_data.points.size());
-		                const int final_tets = static_cast<int>(voladj_data.local_tets.size() + voladj_data.ghost_tets.size());
+		                const int final_points = local_points + ghost_added_points;
+		                const int final_tets = local_tets + ghost_added_tets;
 		                int shared_vertex_count = 0;
 		                int owned_shared_vertex_count = 0;
 		                int received_shared_vertex_count = 0;
@@ -786,7 +797,9 @@ int main(int argc, char **argv) {
 		                        stream_meshquality_dump << "ne=" << mq_stats.ne << "\n";
 		                        stream_meshquality_dump << "min_volume=" << mq_stats.min_volume << "\n";
 		                        stream_meshquality_dump << "max_volume=" << mq_stats.max_volume << "\n";
-		                        stream_meshquality_dump << "avg_volume=" << mq_stats.avg_volume << "\n";
+		                        stream_meshquality_dump << "avg_volume="
+		                                               << ((mq_stats.ne == 0) ? 0.0 : (mq_stats.volume_sum / mq_stats.ne))
+		                                               << "\n";
 		                        stream_meshquality_dump << "\n";
 		                        std::ofstream stream_volwithadj_dump(stream_volwithadj_dump_path, std::ios::app);
 		                        stream_volwithadj_dump << "rank=" << id << "\n";

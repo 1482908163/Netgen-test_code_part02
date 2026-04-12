@@ -3,5 +3,6 @@ result/
 inputData/
 err/
 *.sh
-.codex
-.gitgnore  
+mesh_occ_mpi/3DNgmesher.cpp（old）.cpp
+
+ 

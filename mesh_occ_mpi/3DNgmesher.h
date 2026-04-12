@@ -64,15 +64,47 @@ struct StreamGhostVE {
     double xyz[4][3];
 };
 
+struct StreamGhostTetRecord {
+    int gid;
+    int domidx;
+    int global_vids[4];
+};
+
 struct StreamVolWithAdjData {
-    std::vector<PointCoordRecord> points;
-    std::vector<int> point_global_ids;
-    std::vector<TetRecord> local_tets;
-    std::vector<TetRecord> ghost_tets;
-    std::vector<FaceRecord> surfaces;
+    const StreamMeshView *smv = nullptr;
+    std::vector<StreamGhostTetRecord> ghost_tets;
+    std::vector<int> ghost_point_global_ids;
+    std::vector<PointCoordRecord> ghost_points;
+    std::map<int, int> ghost_global_pid_to_index;
 };
 
 static_assert(std::is_trivially_copyable<StreamGhostVE>::value, "StreamGhostVE must be trivially copyable");
+
+struct StreamFullMeshQualityStats {
+    int np = 0;
+    int nse = 0;
+    int ne = 0;
+    int aspect_ratio_count[6] = {0, 0, 0, 0, 0, 0};
+    double triangle_length_width_ratio_sum = 0.0;
+    double triangle_length_width_ratio_max = 0.0;
+    double triangle_length_width_ratio_min = 0.0;
+    double triangle_skew_sum = 0.0;
+    double triangle_skew_max = 0.0;
+    double triangle_skew_min = 0.0;
+    double triangle_internal_angle_min = 0.0;
+    double triangle_internal_angle_max = 0.0;
+    double tetrahedrons_length_width_ratio_sum = 0.0;
+    double tetrahedrons_length_width_ratio_max = 0.0;
+    double tetrahedrons_length_width_ratio_min = 0.0;
+    double tetrahedrons_skew_sum = 0.0;
+    double tetrahedrons_skew_max = 0.0;
+    double tetrahedrons_skew_min = 0.0;
+    double tetrahedrons_internal_angle_min = 0.0;
+    double tetrahedrons_internal_angle_max = 0.0;
+    double min_volume = 0.0;
+    double max_volume = 0.0;
+    double volume_sum = 0.0;
+};
 
 bool InitStreamMeshView(StreamMeshView &view,
     const std::string &point_table_path,
@@ -120,6 +152,14 @@ StreamMeshQualityStats ComputeMeshQualityFromStreams(const StreamMeshView &smv);
 void WriteMeshQualityFromStreams(const std::string &output_path,
     int id,
     const StreamMeshQualityStats &stats);
+StreamFullMeshQualityStats ComputeFullMeshQualityFromVolWithAdjStreams(
+    const StreamVolWithAdjData &data,
+    const int *newid);
+void WriteFullMeshQualityFromVolWithAdjStreams(
+    const std::string &output_path,
+    int id,
+    const StreamFullMeshQualityStats &stats,
+    MPI_Comm comm);
 void com_baryVolumeElements_from_streams(
     const StreamMeshView &smv,
     MPI_Comm comm,
@@ -131,7 +171,8 @@ void com_baryVolumeElements_from_streams(
     StreamVolWithAdjData &out_data);
 void WriteVolWithAdjFromStreams(const std::string &output_path,
     int id,
-    const StreamVolWithAdjData &data);
+    const StreamVolWithAdjData &data,
+    const int *newid);
 
 void RefineOneLevelToFile(void *submesh, const std::string &infile, const std::string &outfile, std::size_t batch_faces, std::map<Barycentric, int, CompBarycentric> &baryc2locvrtxmap, std::map<int, Barycentric> &locvrtx2barycmap, std::map<IntPair, int, IntPairCompare> &edgemap);
 void AddFacesFromFileToMesh(void *submesh, const std::string &filepath, std::size_t batch_faces);
