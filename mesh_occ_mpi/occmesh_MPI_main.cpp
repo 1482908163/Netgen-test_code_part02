@@ -592,13 +592,22 @@ int main(int argc, char **argv) {
 		                    VEgid,
 		                    id);
 		                print_stage_mem("after com_barycoords_from_streams", id);
+		                std::vector<PointCoordRecord> partition_local_points_cache(
+		                    static_cast<std::size_t>(stream_np + 1));
+		                for (int pid = 1; pid <= stream_np; ++pid) {
+		                    StreamMesh_GetPoint(
+		                        smv,
+		                        pid,
+		                        partition_local_points_cache[static_cast<std::size_t>(pid)].xyz);
+		                }
 		                WritePartitionNodesElementsFromStreams(
 		                    smv,
 		                    OUTPUT_PATH,
 		                    numParts,
 		                    id,
 		                    newid,
-		                    VEgid);
+		                    VEgid,
+		                    &partition_local_points_cache);
 		                WritePartitionSharedFromAdjBarycs(
 		                    OUTPUT_PATH,
 		                    numParts,
@@ -614,6 +623,7 @@ int main(int argc, char **argv) {
 		                        newid,
 		                        VEgid,
 		                        adjbarycs_stream);
+		                print_stage_mem("after WritePartitionBoundaryAndHeaderFromStreams", id);
 		                StreamVolWithAdjData voladj_data;
 		                print_stage_mem("before com_baryVolumeElements_from_streams", id);
 		                com_baryVolumeElements_from_streams(
@@ -626,6 +636,7 @@ int main(int argc, char **argv) {
 		                    id,
 		                    voladj_data);
 		                print_stage_mem("after com_baryVolumeElements_from_streams", id);
+		                print_stage_mem("before ComputeFullMeshQualityFromVolWithAdjStreams", id);
 		                const StreamFullMeshQualityStats mq_stats =
 		                    ComputeFullMeshQualityFromVolWithAdjStreams(voladj_data, newid);
 		                print_stage_mem("after ComputeFullMeshQualityFromVolWithAdjStreams", id);

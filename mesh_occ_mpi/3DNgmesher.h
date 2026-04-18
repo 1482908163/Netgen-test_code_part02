@@ -76,6 +76,9 @@ struct StreamVolWithAdjData {
     std::vector<int> ghost_point_global_ids;
     std::vector<PointCoordRecord> ghost_points;
     std::map<int, int> ghost_global_pid_to_index;
+    std::vector<PointCoordRecord> local_points_cache;
+    std::vector<int> global_pid_to_local_pid_dense;
+    std::map<int, int> local_global_pid_to_local_pid;
 };
 
 static_assert(std::is_trivially_copyable<StreamGhostVE>::value, "StreamGhostVE must be trivially copyable");
@@ -132,7 +135,8 @@ void WritePartitionNodesElementsFromStreams(const StreamMeshView &smv,
     int numParts,
     int id,
     const int *newid,
-    const int *VEgid);
+    const int *VEgid,
+    const std::vector<PointCoordRecord> *local_points_cache = nullptr);
 void WritePartitionSharedFromAdjBarycs(const std::string &output_path,
     int numParts,
     int id,

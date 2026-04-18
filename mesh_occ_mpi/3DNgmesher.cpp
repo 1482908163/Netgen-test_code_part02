@@ -1614,7 +1614,8 @@ void WritePartitionNodesElementsFromStreams(
 	int numParts,
 	int id,
 	const int *newid,
-	const int *VEgid)
+	const int *VEgid,
+	const std::vector<PointCoordRecord> *local_points_cache)
 {
 	const std::filesystem::path partition_dir =
 		std::filesystem::path(output_path) / ("partitioning." + std::to_string(numParts));
@@ -1631,17 +1632,35 @@ void WritePartitionNodesElementsFromStreams(
 		FailStreamOperation("failed to open partition elements file: " + element_path.string());
 	}
 
+	constexpr int kWriterFlushLines = 4096;
+	std::string element_buffer;
+	element_buffer.reserve(1 << 20);
+	std::ostringstream line;
+	int buffered_element_lines = 0;
 	const int ne = StreamMesh_GetNE(smv);
 	for (int i = 1; i <= ne; ++i)
 	{
 		int tet[4];
 		int domidx = 0;
 		StreamMesh_GetVolumeElement(smv, i, tet, domidx);
-		outelements << VEgid[i] << " 1 504 "
-		            << newid[tet[0]] << " "
-		            << newid[tet[1]] << " "
-		            << newid[tet[2]] << " "
-		            << newid[tet[3]] << std::endl;
+		line.str("");
+		line.clear();
+		line << VEgid[i] << " 1 504 "
+		     << newid[tet[0]] << " "
+		     << newid[tet[1]] << " "
+		     << newid[tet[2]] << " "
+		     << newid[tet[3]] << '\n';
+		element_buffer += line.str();
+		if (++buffered_element_lines >= kWriterFlushLines)
+		{
+			outelements << element_buffer;
+			element_buffer.clear();
+			buffered_element_lines = 0;
+		}
+	}
+	if (!element_buffer.empty())
+	{
+		outelements << element_buffer;
 	}
 
 	std::ofstream outnodes(node_path);
@@ -1650,15 +1669,46 @@ void WritePartitionNodesElementsFromStreams(
 		FailStreamOperation("failed to open partition nodes file: " + node_path.string());
 	}
 
+	std::string node_buffer;
+	node_buffer.reserve(1 << 20);
+	int buffered_node_lines = 0;
 	const int np = StreamMesh_GetNP(smv);
 	for (int i = 1; i <= np; ++i)
 	{
 		double point[3];
-		StreamMesh_GetPoint(smv, i, point);
-		outnodes << newid[i] << " -1 "
-		         << point[0] << " "
-		         << point[1] << " "
-		         << point[2] << std::endl;
+		if (local_points_cache != nullptr)
+		{
+			if (static_cast<std::size_t>(i) >= local_points_cache->size())
+			{
+				FailStreamOperation("local point cache index out of range in partition nodes writer");
+			}
+			const PointCoordRecord &cached_point = (*local_points_cache)[static_cast<std::size_t>(i)];
+			point[0] = cached_point.xyz[0];
+			point[1] = cached_point.xyz[1];
+			point[2] = cached_point.xyz[2];
+		}
+		else
+		{
+			StreamMesh_GetPoint(smv, i, point);
+		}
+
+		line.str("");
+		line.clear();
+		line << newid[i] << " -1 "
+		     << point[0] << " "
+		     << point[1] << " "
+		     << point[2] << '\n';
+		node_buffer += line.str();
+		if (++buffered_node_lines >= kWriterFlushLines)
+		{
+			outnodes << node_buffer;
+			node_buffer.clear();
+			buffered_node_lines = 0;
+		}
+	}
+	if (!node_buffer.empty())
+	{
+		outnodes << node_buffer;
 	}
 }
 
@@ -1681,6 +1731,11 @@ void WritePartitionSharedFromAdjBarycs(
 		FailStreamOperation("failed to open partition shared file: " + shared_path.string());
 	}
 
+	constexpr int kWriterFlushLines = 4096;
+	std::string shared_buffer;
+	shared_buffer.reserve(1 << 20);
+	std::ostringstream line;
+	int buffered_shared_lines = 0;
 	for (const auto &entry : adjbarycs)
 	{
 		const int locid = entry.first;
@@ -1697,12 +1752,25 @@ void WritePartitionSharedFromAdjBarycs(
 			continue;
 		}
 
-		out << newid[locid] << " " << parts.size() << " ";
+		line.str("");
+		line.clear();
+		line << newid[locid] << " " << parts.size() << " ";
 		for (const int rank : parts)
 		{
-			out << (rank + 1) << " ";
+			line << (rank + 1) << " ";
 		}
-		out << std::endl;
+		line << '\n';
+		shared_buffer += line.str();
+		if (++buffered_shared_lines >= kWriterFlushLines)
+		{
+			out << shared_buffer;
+			shared_buffer.clear();
+			buffered_shared_lines = 0;
+		}
+	}
+	if (!shared_buffer.empty())
+	{
+		out << shared_buffer;
 	}
 }
 
@@ -1790,6 +1858,11 @@ StreamBoundaryHeaderStats WritePartitionBoundaryAndHeaderFromStreams(
 		FailStreamOperation("failed to open partition boundary file: " + boundary_path.string());
 	}
 
+	constexpr int kWriterFlushLines = 4096;
+	std::string boundary_buffer;
+	boundary_buffer.reserve(1 << 20);
+	std::ostringstream line;
+	int buffered_boundary_lines = 0;
 	int number = 0;
 	for (int sid = 1; sid <= nse; ++sid)
 	{
@@ -1815,11 +1888,24 @@ StreamBoundaryHeaderStats WritePartitionBoundaryAndHeaderFromStreams(
 		}
 
 		++number;
-		outboundarys << number << " " << geoid << " " << myit->second
-		             << " 0 303 "
-		             << newid[tri[0]] << " "
-		             << newid[tri[1]] << " "
-		             << newid[tri[2]] << std::endl;
+		line.str("");
+		line.clear();
+		line << number << " " << geoid << " " << myit->second
+		     << " 0 303 "
+		     << newid[tri[0]] << " "
+		     << newid[tri[1]] << " "
+		     << newid[tri[2]] << '\n';
+		boundary_buffer += line.str();
+		if (++buffered_boundary_lines >= kWriterFlushLines)
+		{
+			outboundarys << boundary_buffer;
+			boundary_buffer.clear();
+			buffered_boundary_lines = 0;
+		}
+	}
+	if (!boundary_buffer.empty())
+	{
+		outboundarys << boundary_buffer;
 	}
 
 	std::ofstream outheader(header_path);
@@ -1828,13 +1914,13 @@ StreamBoundaryHeaderStats WritePartitionBoundaryAndHeaderFromStreams(
 		FailStreamOperation("failed to open partition header file: " + header_path.string());
 	}
 
-	outheader << np << " " << ne << " " << number << std::endl;
-	outheader << 2 << std::endl;
-	outheader << "504 " << ne << std::endl;
-	outheader << "303 " << number << std::endl;
+	outheader << np << " " << ne << " " << number << '\n';
+	outheader << 2 << '\n';
+	outheader << "504 " << ne << '\n';
+	outheader << "303 " << number << '\n';
 	if (!adjbarycs.empty())
 	{
-		outheader << adjbarycs.size() << " 0" << std::endl;
+		outheader << adjbarycs.size() << " 0" << '\n';
 	}
 
 	StreamBoundaryHeaderStats stats;
@@ -1909,6 +1995,40 @@ void WriteMeshQualityFromStreams(
 	output << "avg_volume=" << stats.avg_volume << "\n";
 }
 
+static void BuildLocalPointCacheForVolAdj(const StreamMeshView &smv,
+	const int *newid,
+	StreamVolWithAdjData &out_data)
+{
+	const int local_np = StreamMesh_GetNP(smv);
+	out_data.local_points_cache.clear();
+	out_data.local_points_cache.resize(static_cast<std::size_t>(local_np + 1));
+	out_data.local_global_pid_to_local_pid.clear();
+
+	int max_global_pid = 0;
+	for (int pid = 1; pid <= local_np; ++pid)
+	{
+		PointCoordRecord &point = out_data.local_points_cache[static_cast<std::size_t>(pid)];
+		StreamMesh_GetPoint(smv, pid, point.xyz);
+		if (newid[pid] > 0)
+		{
+			out_data.local_global_pid_to_local_pid[newid[pid]] = pid;
+			max_global_pid = (std::max)(max_global_pid, newid[pid]);
+		}
+	}
+
+	out_data.global_pid_to_local_pid_dense.clear();
+	if (max_global_pid > 0 &&
+		max_global_pid <= 2000000 &&
+		max_global_pid <= local_np * 2)
+	{
+		out_data.global_pid_to_local_pid_dense.assign(static_cast<std::size_t>(max_global_pid + 1), 0);
+		for (const auto &entry : out_data.local_global_pid_to_local_pid)
+		{
+			out_data.global_pid_to_local_pid_dense[static_cast<std::size_t>(entry.first)] = entry.second;
+		}
+	}
+}
+
 static void LookupVolAdjPointXYZ(const StreamVolWithAdjData &data,
 	const int *newid,
 	int global_pid,
@@ -1919,28 +2039,31 @@ static void LookupVolAdjPointXYZ(const StreamVolWithAdjData &data,
 		FailStreamOperation("volwithadj lookup requested without stream mesh view");
 	}
 
-	static const StreamMeshView *cached_smv = nullptr;
-	static const int *cached_newid = nullptr;
-	static std::map<int, int> cached_local_pid_by_global_pid;
-	if (cached_smv != data.smv || cached_newid != newid)
+	int local_pid = 0;
+	if (!data.global_pid_to_local_pid_dense.empty() &&
+		global_pid >= 0 &&
+		static_cast<std::size_t>(global_pid) < data.global_pid_to_local_pid_dense.size())
 	{
-		cached_local_pid_by_global_pid.clear();
-		const int np = StreamMesh_GetNP(*data.smv);
-		for (int pid = 1; pid <= np; ++pid)
-		{
-			if (newid[pid] > 0)
-			{
-				cached_local_pid_by_global_pid[newid[pid]] = pid;
-			}
-		}
-		cached_smv = data.smv;
-		cached_newid = newid;
+		local_pid = data.global_pid_to_local_pid_dense[static_cast<std::size_t>(global_pid)];
 	}
-
-	const auto local_it = cached_local_pid_by_global_pid.find(global_pid);
-	if (local_it != cached_local_pid_by_global_pid.end())
+	if (local_pid == 0)
 	{
-		StreamMesh_GetPoint(*data.smv, local_it->second, xyz);
+		const auto local_it = data.local_global_pid_to_local_pid.find(global_pid);
+		if (local_it != data.local_global_pid_to_local_pid.end())
+		{
+			local_pid = local_it->second;
+		}
+	}
+	if (local_pid > 0)
+	{
+		if (static_cast<std::size_t>(local_pid) >= data.local_points_cache.size())
+		{
+			FailStreamOperation("local point cache index out of range for volwithadj point lookup");
+		}
+		const PointCoordRecord &point = data.local_points_cache[static_cast<std::size_t>(local_pid)];
+		xyz[0] = point.xyz[0];
+		xyz[1] = point.xyz[1];
+		xyz[2] = point.xyz[2];
 		return;
 	}
 
@@ -1977,6 +2100,9 @@ StreamFullMeshQualityStats ComputeFullMeshQualityFromVolWithAdjStreams(
 	stats.tetrahedrons_skew_min = 0x3f3f3f;
 	stats.min_volume = std::numeric_limits<double>::max();
 
+	int rank = 0;
+	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+	std::cout << "[STREAM] meshQuality surface pass begin rank=" << rank << "\n" << std::flush;
 	std::ifstream surface_input(smv.surface_file_path, std::ios::binary);
 	if (!surface_input)
 	{
@@ -1991,7 +2117,11 @@ StreamFullMeshQualityStats ComputeFullMeshQualityFromVolWithAdjStreams(
 			double xyz[3][3];
 			for (int k = 0; k < 3; ++k)
 			{
-				StreamMesh_GetPoint(smv, face.lsvrtx[k], xyz[k]);
+				const PointCoordRecord &point =
+					data.local_points_cache.at(static_cast<std::size_t>(face.lsvrtx[k]));
+				xyz[k][0] = point.xyz[0];
+				xyz[k][1] = point.xyz[1];
+				xyz[k][2] = point.xyz[2];
 			}
 
 			const double lwr = length_width_ratio(xyz);
@@ -2057,6 +2187,7 @@ StreamFullMeshQualityStats ComputeFullMeshQualityFromVolWithAdjStreams(
 		stats.volume_sum += volume;
 	};
 
+	std::cout << "[STREAM] meshQuality volume pass begin rank=" << rank << "\n" << std::flush;
 	std::ifstream tet_input(smv.tet_file_path, std::ios::binary);
 	if (!tet_input)
 	{
@@ -2073,7 +2204,11 @@ StreamFullMeshQualityStats ComputeFullMeshQualityFromVolWithAdjStreams(
 			FromTetRecord(record, tet, domidx);
 			for (int k = 0; k < 4; ++k)
 			{
-				StreamMesh_GetPoint(smv, tet[k], Vxyz[k]);
+				const PointCoordRecord &point =
+					data.local_points_cache.at(static_cast<std::size_t>(tet[k]));
+				Vxyz[k][0] = point.xyz[0];
+				Vxyz[k][1] = point.xyz[1];
+				Vxyz[k][2] = point.xyz[2];
 			}
 			update_tet_quality(Vxyz);
 		}
@@ -2200,17 +2335,9 @@ void com_baryVolumeElements_from_streams(
 	out_data.ghost_point_global_ids.clear();
 	out_data.ghost_points.clear();
 	out_data.ghost_global_pid_to_index.clear();
+	BuildLocalPointCacheForVolAdj(smv, newid, out_data);
 
-	const int np = StreamMesh_GetNP(smv);
 	const int ne = StreamMesh_GetNE(smv);
-	std::map<int, int> local_global_pid_to_local_pid;
-	for (int pid = 1; pid <= np; ++pid)
-	{
-		if (newid[pid] > 0)
-		{
-			local_global_pid_to_local_pid[newid[pid]] = pid;
-		}
-	}
 
 	std::map<int, std::vector<StreamGhostVE>> send_map;
 	for (int eid = 1; eid <= ne; ++eid)
@@ -2253,7 +2380,11 @@ void com_baryVolumeElements_from_streams(
 		for (int k = 0; k < 4; ++k)
 		{
 			ve.pindex[k] = newid[tet[k]];
-			StreamMesh_GetPoint(smv, tet[k], ve.xyz[k]);
+			const PointCoordRecord &point =
+				out_data.local_points_cache.at(static_cast<std::size_t>(tet[k]));
+			ve.xyz[k][0] = point.xyz[0];
+			ve.xyz[k][1] = point.xyz[1];
+			ve.xyz[k][2] = point.xyz[2];
 		}
 
 		for (const int dst : pid_tmp)
@@ -2320,7 +2451,7 @@ void com_baryVolumeElements_from_streams(
 		for (int k = 0; k < 4; ++k)
 		{
 			ghost_record.global_vids[k] = ve.pindex[k];
-			if (local_global_pid_to_local_pid.find(ve.pindex[k]) != local_global_pid_to_local_pid.end())
+			if (out_data.local_global_pid_to_local_pid.find(ve.pindex[k]) != out_data.local_global_pid_to_local_pid.end())
 			{
 				continue;
 			}
@@ -2354,6 +2485,9 @@ void WriteVolWithAdjFromStreams(const std::string &output_path,
 	const int local_np = StreamMesh_GetNP(smv);
 	const int local_ne = StreamMesh_GetNE(smv);
 	const int nse = StreamMesh_GetNSE(smv);
+	int rank = 0;
+	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+	std::cout << "[STREAM] volwithadj writer begin rank=" << rank << "\n" << std::flush;
 	const std::filesystem::path out_path =
 		std::filesystem::path(output_path) / "volwithadj" / ("volwithadj" + std::to_string(id) + ".vol");
 	EnsureParentDirectory(out_path.string());
@@ -2455,9 +2589,8 @@ void WriteVolWithAdjFromStreams(const std::string &output_path,
 	output << std::setprecision(std::numeric_limits<double>::max_digits10);
 	for (int pid = 1; pid <= local_np; ++pid)
 	{
-		double xyz[3];
-		StreamMesh_GetPoint(smv, pid, xyz);
-		output << xyz[0] << " " << xyz[1] << " " << xyz[2] << "\n";
+		const PointCoordRecord &point = data.local_points_cache.at(static_cast<std::size_t>(pid));
+		output << point.xyz[0] << " " << point.xyz[1] << " " << point.xyz[2] << "\n";
 	}
 	for (const PointCoordRecord &point : data.ghost_points)
 	{
