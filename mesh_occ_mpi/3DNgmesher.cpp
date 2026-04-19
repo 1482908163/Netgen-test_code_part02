@@ -10,6 +10,7 @@
 #include <iostream>
 #include <sstream>
 #include <sys/resource.h>
+#include <unordered_map>
 #include "3DNgmesher.h"
 #include <string>
 #include <time.h>
@@ -58,52 +59,24 @@ struct EdgeMidRecord {
 	int mid;
 };
 
-class Index3
+struct BoundaryTetFaceRecord
 {
-public:
-	int x[3];
-
-	Index3()
-	{
-		x[0] = 0;
-		x[1] = 0;
-		x[2] = 0;
-	}
-
-	void swapel(int a, int b)
-	{
-		int tmp = x[a];
-		x[a] = x[b];
-		x[b] = tmp;
-	}
-
-	void Sort()
-	{
-		if (x[1] < x[0]) swapel(1, 0);
-		if (x[2] < x[1]) swapel(2, 1);
-		if (x[1] < x[0]) swapel(1, 0);
-	}
+	int a;
+	int b;
+	int c;
+	int vegid;
 };
 
-bool fncomp(Index3 in1, Index3 in2)
+struct BoundarySurfaceRecord
 {
-	if (in1.x[0] < in2.x[0])
-		return true;
-	else if (in1.x[0] > in2.x[0])
-		return false;
-
-	if (in1.x[1] < in2.x[1])
-		return true;
-	else if (in1.x[1] > in2.x[1])
-		return false;
-
-	if (in1.x[2] < in2.x[2])
-		return true;
-	else if (in1.x[2] > in2.x[2])
-		return false;
-
-	return false;
-}
+	int key_a;
+	int key_b;
+	int key_c;
+	int geoid;
+	int v0;
+	int v1;
+	int v2;
+};
 
 void VecSub(const double a[3], const double b[3], double out[3])
 {
@@ -140,6 +113,35 @@ double TetVolumeFromPoints(const double p0[3],
 	return fabs(Dot3(a, cross_bc)) / 6.0;
 }
 
+double GetCurrentRssMb();
+double GetPeakRssMb();
+
+void PrintStreamStageMem(const char *tag)
+{
+	double local_current = GetCurrentRssMb();
+	double local_peak = GetPeakRssMb();
+	double global_current = 0.0;
+	double global_peak = 0.0;
+	int id = 0;
+	MPI_Comm_rank(MPI_COMM_WORLD, &id);
+	MPI_Reduce(&local_current, &global_current, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+	MPI_Reduce(&local_peak, &global_peak, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+	if (id == 0)
+	{
+		std::cout << "[MEM] " << tag << " : current=" << global_current
+		          << " MB, peak=" << global_peak << " MB" << std::endl;
+	}
+}
+
+std::size_t BoundaryFaceShardIndex(const FaceKey &key, std::size_t num_shards)
+{
+	if (num_shards == 0)
+	{
+		return 0;
+	}
+	return FaceKeyHash{}(key) % num_shards;
+}
+
 MPI_Datatype CreateMpiGhostVeType()
 {
 	StreamGhostVE dummy{};
@@ -165,6 +167,8 @@ MPI_Datatype CreateMpiGhostVeType()
 
 static_assert(std::is_trivially_copyable<EdgeReqRecord>::value, "EdgeReqRecord must be trivially copyable");
 static_assert(std::is_trivially_copyable<EdgeMidRecord>::value, "EdgeMidRecord must be trivially copyable");
+static_assert(std::is_trivially_copyable<BoundaryTetFaceRecord>::value, "BoundaryTetFaceRecord must be trivially copyable");
+static_assert(std::is_trivially_copyable<BoundarySurfaceRecord>::value, "BoundarySurfaceRecord must be trivially copyable");
 
 void FailStreamOperation(const std::string &message);
 void EnsureParentDirectory(const std::string &filepath);
@@ -1808,8 +1812,271 @@ StreamBoundaryHeaderStats WritePartitionBoundaryAndHeaderFromStreams(
 	int id,
 	const int *newid,
 	const int *VEgid,
-	const std::map<int, std::list<int>> &adjbarycs)
+	const std::map<int, std::list<int>> &adjbarycs,
+	bool keep_shard_files)
 {
+	constexpr std::size_t kBoundaryShardFlushRecords = 4096;
+	constexpr std::size_t kBoundaryShardCount = 256;
+	constexpr int kBoundaryWriterFlushLines = 4096;
+	StreamBoundaryHeaderStats stats;
+
+	auto write_tet_face_records = [](std::ofstream &output,
+		const std::vector<BoundaryTetFaceRecord> &records)
+	{
+		if (records.empty())
+		{
+			return;
+		}
+		output.write(reinterpret_cast<const char *>(records.data()),
+			static_cast<std::streamsize>(records.size() * sizeof(BoundaryTetFaceRecord)));
+		if (!output)
+		{
+			FailStreamOperation("failed to write tet-face shard records");
+		}
+	};
+
+	auto write_surface_records = [](std::ofstream &output,
+		const std::vector<BoundarySurfaceRecord> &records)
+	{
+		if (records.empty())
+		{
+			return;
+		}
+		output.write(reinterpret_cast<const char *>(records.data()),
+			static_cast<std::streamsize>(records.size() * sizeof(BoundarySurfaceRecord)));
+		if (!output)
+		{
+			FailStreamOperation("failed to write boundary-surface shard records");
+		}
+	};
+
+	auto build_tet_face_shard_files = [&](const std::filesystem::path &work_dir)
+	{
+		std::vector<std::string> shard_files(kBoundaryShardCount);
+		std::vector<std::ofstream> outputs(kBoundaryShardCount);
+		std::vector<std::vector<BoundaryTetFaceRecord>> buffers(kBoundaryShardCount);
+		for (std::size_t shard = 0; shard < kBoundaryShardCount; ++shard)
+		{
+			const std::filesystem::path filepath =
+				work_dir / ("boundary_tetface_shard_" + std::to_string(shard) + ".bin");
+			shard_files[shard] = filepath.string();
+			EnsureParentDirectory(shard_files[shard]);
+			outputs[shard].open(filepath, std::ios::binary | std::ios::trunc);
+			if (!outputs[shard])
+			{
+				FailStreamOperation("failed to open tet-face shard file: " + filepath.string());
+			}
+			buffers[shard].reserve(kBoundaryShardFlushRecords);
+		}
+
+		std::ifstream input(smv.tet_file_path, std::ios::binary);
+		if (!input)
+		{
+			FailStreamOperation("failed to open tet stream for boundary sharding: " + smv.tet_file_path);
+		}
+
+		TetRecord record{};
+		int eid = 0;
+		while (input.read(reinterpret_cast<char *>(&record), static_cast<std::streamsize>(sizeof(TetRecord))))
+		{
+			++eid;
+			int tet[4];
+			int domidx = 0;
+			FromTetRecord(record, tet, domidx);
+			for (int j = 0; j < 4; ++j)
+			{
+				int face_vids[3];
+				int l = 0;
+				for (int k = 0; k < 4; ++k)
+				{
+					if (k != j)
+					{
+						face_vids[l] = newid[tet[k]];
+						++l;
+					}
+				}
+				const FaceKey key = make_face_key(face_vids[0], face_vids[1], face_vids[2]);
+				const std::size_t shard = BoundaryFaceShardIndex(key, kBoundaryShardCount);
+				buffers[shard].push_back(BoundaryTetFaceRecord{key.v[0], key.v[1], key.v[2], VEgid[eid]});
+				if (buffers[shard].size() >= kBoundaryShardFlushRecords)
+				{
+					write_tet_face_records(outputs[shard], buffers[shard]);
+					buffers[shard].clear();
+				}
+			}
+		}
+
+		if (!input.eof())
+		{
+			FailStreamOperation("tet stream is truncated during boundary sharding: " + smv.tet_file_path);
+		}
+
+		for (std::size_t shard = 0; shard < kBoundaryShardCount; ++shard)
+		{
+			write_tet_face_records(outputs[shard], buffers[shard]);
+		}
+		return shard_files;
+	};
+
+	auto build_surface_shard_files = [&](const std::filesystem::path &work_dir)
+	{
+		std::vector<std::string> shard_files(kBoundaryShardCount);
+		std::vector<std::ofstream> outputs(kBoundaryShardCount);
+		std::vector<std::vector<BoundarySurfaceRecord>> buffers(kBoundaryShardCount);
+		for (std::size_t shard = 0; shard < kBoundaryShardCount; ++shard)
+		{
+			const std::filesystem::path filepath =
+				work_dir / ("boundary_surface_shard_" + std::to_string(shard) + ".bin");
+			shard_files[shard] = filepath.string();
+			EnsureParentDirectory(shard_files[shard]);
+			outputs[shard].open(filepath, std::ios::binary | std::ios::trunc);
+			if (!outputs[shard])
+			{
+				FailStreamOperation("failed to open boundary-surface shard file: " + filepath.string());
+			}
+			buffers[shard].reserve(kBoundaryShardFlushRecords);
+		}
+
+		std::ifstream input(smv.surface_file_path, std::ios::binary);
+		if (!input)
+		{
+			FailStreamOperation("failed to open surface stream for boundary sharding: " + smv.surface_file_path);
+		}
+
+		FaceRecord record{};
+		while (input.read(reinterpret_cast<char *>(&record), static_cast<std::streamsize>(sizeof(FaceRecord))))
+		{
+			const xdFace face = FromFaceRecord(record);
+			if (face.patbound != 0)
+			{
+				++stats.skipped_patbound;
+				continue;
+			}
+
+			const int gv0 = newid[face.lsvrtx[0]];
+			const int gv1 = newid[face.lsvrtx[1]];
+			const int gv2 = newid[face.lsvrtx[2]];
+			const FaceKey key = make_face_key(gv0, gv1, gv2);
+			const std::size_t shard = BoundaryFaceShardIndex(key, kBoundaryShardCount);
+			buffers[shard].push_back(BoundarySurfaceRecord{
+				key.v[0],
+				key.v[1],
+				key.v[2],
+				face.geoboundary + 1,
+				gv0,
+				gv1,
+				gv2});
+			if (buffers[shard].size() >= kBoundaryShardFlushRecords)
+			{
+				write_surface_records(outputs[shard], buffers[shard]);
+				buffers[shard].clear();
+			}
+		}
+
+		if (!input.eof())
+		{
+			FailStreamOperation("surface stream is truncated during boundary sharding: " + smv.surface_file_path);
+		}
+
+		for (std::size_t shard = 0; shard < kBoundaryShardCount; ++shard)
+		{
+			write_surface_records(outputs[shard], buffers[shard]);
+		}
+		return shard_files;
+	};
+
+	auto write_boundary_from_shards = [&](const std::vector<std::string> &tet_face_shards,
+		const std::vector<std::string> &surface_shards,
+		const std::filesystem::path &boundary_path)
+	{
+		std::ofstream outboundarys(boundary_path);
+		if (!outboundarys)
+		{
+			FailStreamOperation("failed to open partition boundary file: " + boundary_path.string());
+		}
+
+		std::string boundary_buffer;
+		boundary_buffer.reserve(1 << 20);
+		std::ostringstream line;
+		int buffered_boundary_lines = 0;
+		int number = 0;
+
+		for (std::size_t shard = 0; shard < tet_face_shards.size(); ++shard)
+		{
+			const int record_count =
+				CountRecordsByFileSize(tet_face_shards[shard], sizeof(BoundaryTetFaceRecord));
+			std::unordered_map<FaceKey, int, FaceKeyHash> face2vol;
+			face2vol.reserve(static_cast<std::size_t>(record_count) * 2 + 1024);
+
+			std::ifstream tet_input(tet_face_shards[shard], std::ios::binary);
+			if (!tet_input)
+			{
+				FailStreamOperation("failed to open tet-face shard file: " + tet_face_shards[shard]);
+			}
+
+			const double build_face2vol_t0 = MPI_Wtime();
+			BoundaryTetFaceRecord tet_record{};
+			while (tet_input.read(reinterpret_cast<char *>(&tet_record),
+				static_cast<std::streamsize>(sizeof(BoundaryTetFaceRecord))))
+			{
+				face2vol.emplace(FaceKey{{tet_record.a, tet_record.b, tet_record.c}}, tet_record.vegid);
+			}
+			if (!tet_input.eof())
+			{
+				FailStreamOperation("tet-face shard file is truncated: " + tet_face_shards[shard]);
+			}
+			stats.time_build_face2vol += MPI_Wtime() - build_face2vol_t0;
+			stats.face2vol_size = std::max(stats.face2vol_size, face2vol.size());
+
+			std::ifstream surface_input(surface_shards[shard], std::ios::binary);
+			if (!surface_input)
+			{
+				FailStreamOperation("failed to open boundary-surface shard file: " + surface_shards[shard]);
+			}
+
+			const double scan_surface_t0 = MPI_Wtime();
+			BoundarySurfaceRecord surface_record{};
+			while (surface_input.read(reinterpret_cast<char *>(&surface_record),
+				static_cast<std::streamsize>(sizeof(BoundarySurfaceRecord))))
+			{
+				const auto it = face2vol.find(FaceKey{{surface_record.key_a, surface_record.key_b, surface_record.key_c}});
+				if (it == face2vol.end())
+				{
+					++stats.missed_surface_faces;
+					continue;
+				}
+
+				++stats.matched_surface_faces;
+				++number;
+				line.str("");
+				line.clear();
+				line << number << " " << surface_record.geoid << " " << it->second
+				     << " 0 303 "
+				     << surface_record.v0 << " "
+				     << surface_record.v1 << " "
+				     << surface_record.v2 << '\n';
+				boundary_buffer += line.str();
+				if (++buffered_boundary_lines >= kBoundaryWriterFlushLines)
+				{
+					outboundarys << boundary_buffer;
+					boundary_buffer.clear();
+					buffered_boundary_lines = 0;
+				}
+			}
+			if (!surface_input.eof())
+			{
+				FailStreamOperation("boundary-surface shard file is truncated: " + surface_shards[shard]);
+			}
+			stats.time_scan_surface += MPI_Wtime() - scan_surface_t0;
+		}
+
+		if (!boundary_buffer.empty())
+		{
+			outboundarys << boundary_buffer;
+		}
+		return number;
+	};
+
 	const std::filesystem::path partition_dir =
 		std::filesystem::path(output_path) / ("partitioning." + std::to_string(numParts));
 	std::filesystem::create_directories(partition_dir);
@@ -1818,96 +2085,32 @@ StreamBoundaryHeaderStats WritePartitionBoundaryAndHeaderFromStreams(
 		partition_dir / ("part." + std::to_string(id + 1) + ".boundary");
 	const std::filesystem::path header_path =
 		partition_dir / ("part." + std::to_string(id + 1) + ".header");
+	const std::filesystem::path work_dir =
+		partition_dir / ("boundary_shards_rank" + std::to_string(id + 1));
 
 	const int np = StreamMesh_GetNP(smv);
 	const int ne = StreamMesh_GetNE(smv);
-	const int nse = StreamMesh_GetNSE(smv);
 
-	Index3 i3;
-	int tet[4];
-	int l;
-	bool (*fn_pt)(Index3, Index3) = fncomp;
-	std::multimap<Index3, int, bool(*)(Index3, Index3)> face2vol(fn_pt);
+	const double build_tet_face_shards_t0 = MPI_Wtime();
+	const std::vector<std::string> tet_face_shards = build_tet_face_shard_files(work_dir);
+	stats.time_build_face2vol += MPI_Wtime() - build_tet_face_shards_t0;
+	PrintStreamStageMem("after BuildTetFaceShardFiles");
 
-	for (int i = 1; i <= ne; ++i)
+	const double build_surface_shards_t0 = MPI_Wtime();
+	const std::vector<std::string> surface_shards = build_surface_shard_files(work_dir);
+	stats.time_scan_surface += MPI_Wtime() - build_surface_shards_t0;
+	PrintStreamStageMem("after BuildBoundarySurfaceShardFiles");
+
+	const int number = write_boundary_from_shards(tet_face_shards, surface_shards, boundary_path);
+	PrintStreamStageMem("after shard boundary join");
+
+	if (!keep_shard_files)
 	{
-		int domidx = 0;
-		StreamMesh_GetVolumeElement(smv, i, tet, domidx);
-		for (int j = 1; j <= 4; ++j)
-		{
-			l = 0;
-			for (int k = 1; k <= 4; ++k)
-			{
-				if (k != j)
-				{
-					i3.x[l] = newid[tet[k - 1]];
-					++l;
-				}
-			}
-			i3.Sort();
-			face2vol.insert(std::make_pair(i3, VEgid[i]));
-		}
+		std::error_code ec;
+		std::filesystem::remove_all(work_dir, ec);
 	}
 
-	std::set<FaceKey> patbound_faces;
-	CollectPatboundFacesFromSurfaceFile(smv.surface_file_path, patbound_faces);
-
-	std::ofstream outboundarys(boundary_path);
-	if (!outboundarys)
-	{
-		FailStreamOperation("failed to open partition boundary file: " + boundary_path.string());
-	}
-
-	constexpr int kWriterFlushLines = 4096;
-	std::string boundary_buffer;
-	boundary_buffer.reserve(1 << 20);
-	std::ostringstream line;
-	int buffered_boundary_lines = 0;
-	int number = 0;
-	for (int sid = 1; sid <= nse; ++sid)
-	{
-		int tri[3];
-		int surfidx = 0;
-		StreamMesh_GetSurfaceElement(smv, sid, tri, surfidx);
-
-		const FaceKey fk = make_face_key(tri[0], tri[1], tri[2]);
-		if (patbound_faces.count(fk) != 0)
-		{
-			continue;
-		}
-
-		const int geoid = surfidx + 1;
-		i3.x[0] = newid[tri[0]];
-		i3.x[1] = newid[tri[1]];
-		i3.x[2] = newid[tri[2]];
-		i3.Sort();
-		const auto myit = face2vol.find(i3);
-		if (myit == face2vol.end())
-		{
-			continue;
-		}
-
-		++number;
-		line.str("");
-		line.clear();
-		line << number << " " << geoid << " " << myit->second
-		     << " 0 303 "
-		     << newid[tri[0]] << " "
-		     << newid[tri[1]] << " "
-		     << newid[tri[2]] << '\n';
-		boundary_buffer += line.str();
-		if (++buffered_boundary_lines >= kWriterFlushLines)
-		{
-			outboundarys << boundary_buffer;
-			boundary_buffer.clear();
-			buffered_boundary_lines = 0;
-		}
-	}
-	if (!boundary_buffer.empty())
-	{
-		outboundarys << boundary_buffer;
-	}
-
+	const double write_header_t0 = MPI_Wtime();
 	std::ofstream outheader(header_path);
 	if (!outheader)
 	{
@@ -1922,8 +2125,8 @@ StreamBoundaryHeaderStats WritePartitionBoundaryAndHeaderFromStreams(
 	{
 		outheader << adjbarycs.size() << " 0" << '\n';
 	}
+	stats.time_write_header = MPI_Wtime() - write_header_t0;
 
-	StreamBoundaryHeaderStats stats;
 	stats.boundary_count = number;
 	return stats;
 }

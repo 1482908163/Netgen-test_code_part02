@@ -2,6 +2,7 @@
 #include "parallelMeshData.h"
 #include "metis.h"
 #include <filesystem>
+#include <functional>
 
 
 bool NewSubmesh(void* mesh, void* submesh);
@@ -29,11 +30,29 @@ struct FaceKey
 {
     int v[3];
 
+    bool operator==(const FaceKey &other) const
+    {
+        return v[0] == other.v[0] &&
+               v[1] == other.v[1] &&
+               v[2] == other.v[2];
+    }
+
     bool operator<(const FaceKey &other) const
     {
         if (v[0] != other.v[0]) return v[0] < other.v[0];
         if (v[1] != other.v[1]) return v[1] < other.v[1];
         return v[2] < other.v[2];
+    }
+};
+
+struct FaceKeyHash
+{
+    std::size_t operator()(const FaceKey &k) const
+    {
+        const std::size_t h1 = std::hash<int>{}(k.v[0]);
+        const std::size_t h2 = std::hash<int>{}(k.v[1]);
+        const std::size_t h3 = std::hash<int>{}(k.v[2]);
+        return h1 ^ (h2 << 1) ^ (h3 << 2);
     }
 };
 
@@ -48,6 +67,13 @@ inline FaceKey make_face_key(int a, int b, int c)
 
 struct StreamBoundaryHeaderStats {
     int boundary_count = 0;
+    double time_build_face2vol = 0.0;
+    double time_scan_surface = 0.0;
+    double time_write_header = 0.0;
+    std::size_t face2vol_size = 0;
+    int skipped_patbound = 0;
+    int matched_surface_faces = 0;
+    int missed_surface_faces = 0;
 };
 
 struct StreamMeshQualityStats {
@@ -151,7 +177,8 @@ StreamBoundaryHeaderStats WritePartitionBoundaryAndHeaderFromStreams(
     int id,
     const int *newid,
     const int *VEgid,
-    const std::map<int, std::list<int>> &adjbarycs);
+    const std::map<int, std::list<int>> &adjbarycs,
+    bool keep_shard_files = false);
 StreamMeshQualityStats ComputeMeshQualityFromStreams(const StreamMeshView &smv);
 void WriteMeshQualityFromStreams(const std::string &output_path,
     int id,

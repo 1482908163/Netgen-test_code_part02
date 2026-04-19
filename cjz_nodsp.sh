@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=Mesh_part
-#SBATCH --output=/vol8/home/hnu_lhz/cjz/NETGEN/test_code_part02/err/Mesh_part_r3_file_only02%j.out
-#SBATCH --error=/vol8/home/hnu_lhz/cjz/NETGEN/test_code_part02/err/Mesh_part_r3_file_only02%j.err
+#SBATCH --output=/vol8/home/hnu_lhz/cjz/NETGEN/test_code_part02/err/Mesh_part_r3_file_only03.1%j.out
+#SBATCH --error=/vol8/home/hnu_lhz/cjz/NETGEN/test_code_part02/err/Mesh_part_r3_file_only03.1%j.err
 #SBATCH -p mt_module
 #SBATCH --nodes=2
 #SBATCH --ntasks=2
@@ -14,7 +14,7 @@ PROJ_DIR=/vol8/home/hnu_lhz/cjz/NETGEN/test_code_part02
 BIN_PATH=$PROJ_DIR/build/mesh_occ_mpi/mesh_occ_mpi
 INPUT_PATH=$PROJ_DIR/inputData/wholewall3solid.STEP
 
-OUTPUT_PATH=$PROJ_DIR/result/part_r3_file_only02/
+OUTPUT_PATH=$PROJ_DIR/result/part_r3_file_only03.1/
 ERR_DIR=$PROJ_DIR/err
 LOCAL_LIB=/vol8/home/hnu_lhz/cjz/lib/usr/lib/aarch64-linux-gnu
 
@@ -53,9 +53,8 @@ yhrun --mpi=pmix "$BIN_PATH" \
   --stream \
   --stream-batch 4096 \
   --stream-vol-batch 4096 \
-  --keep-stream-files \
   --stream-final-mode file_only \
-  -v -adj
+  -adj
 
 end_time=$(date +%s)
 runtime=$((end_time - start_time))
