@@ -116,21 +116,16 @@ double TetVolumeFromPoints(const double p0[3],
 double GetCurrentRssMb();
 double GetPeakRssMb();
 
-void PrintStreamStageMem(const char *tag)
+void PrintStreamStageMem(const char *tag, const std::string &output_path)
 {
-	double local_current = GetCurrentRssMb();
-	double local_peak = GetPeakRssMb();
-	double global_current = 0.0;
-	double global_peak = 0.0;
+	const double local_current = GetCurrentRssMb();
+	const double local_peak = GetPeakRssMb();
 	int id = 0;
 	MPI_Comm_rank(MPI_COMM_WORLD, &id);
-	MPI_Reduce(&local_current, &global_current, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-	MPI_Reduce(&local_peak, &global_peak, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-	if (id == 0)
-	{
-		std::cout << "[MEM] " << tag << " : current=" << global_current
-		          << " MB, peak=" << global_peak << " MB" << std::endl;
-	}
+	std::ostringstream oss;
+	oss << "[MEM] " << tag << " : current=" << local_current
+	    << " MB, peak=" << local_peak << " MB";
+	AppendRankTestoutLine(output_path, id, oss.str());
 }
 
 std::size_t BoundaryFaceShardIndex(const FaceKey &key, std::size_t num_shards)
@@ -614,6 +609,7 @@ bool IsPowerOfTwo(std::size_t value)
 
 void PrintInnerMemLog(const char *phase,
 	int round,
+	const std::string &output_path,
 	void *submesh,
 	const std::map<Barycentric, int, CompBarycentric> &baryc2locvrtxmap,
 	const std::map<int, Barycentric> &locvrtx2barycmap,
@@ -626,7 +622,8 @@ void PrintInnerMemLog(const char *phase,
 	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 	nglib::Ng_Mesh *mesh = (nglib::Ng_Mesh *)submesh;
 
-	std::cout << "[MEM-INNER] rank=" << rank
+	std::ostringstream oss;
+	oss << "[MEM-INNER] rank=" << rank
 		<< " round=" << round
 		<< " phase=" << phase
 		<< " current_rss=" << GetCurrentRssMb() << " MB"
@@ -637,17 +634,17 @@ void PrintInnerMemLog(const char *phase,
 		<< " edgemap.size=" << edgemap.size();
 	if (boundary_edges_size != nullptr)
 	{
-		std::cout << " boundary_edges.size=" << *boundary_edges_size;
+		oss << " boundary_edges.size=" << *boundary_edges_size;
 	}
 	if (output_buffer_size != nullptr)
 	{
-		std::cout << " output_buffer.size=" << *output_buffer_size;
+		oss << " output_buffer.size=" << *output_buffer_size;
 	}
 	if (total_unique_internal_edges != nullptr)
 	{
-		std::cout << " total_unique_internal_edges=" << *total_unique_internal_edges;
+		oss << " total_unique_internal_edges=" << *total_unique_internal_edges;
 	}
-	std::cout << std::endl;
+	AppendRankTestoutLine(output_path, rank, oss.str());
 }
 
 std::size_t ReadFaceBatch(std::ifstream &input, std::vector<FaceRecord> &buffer, std::size_t batch_size)
@@ -1267,6 +1264,18 @@ void StreamRefineFacesToFile(void *submesh,
 }
 
 } // namespace
+
+void AppendRankTestoutLine(const std::string &output_path,
+	int rank,
+	const std::string &line)
+{
+	const std::filesystem::path dir = std::filesystem::path(output_path) / "testout";
+	std::filesystem::create_directories(dir);
+	const std::filesystem::path path = dir / ("testout_rank" + std::to_string(rank) + ".txt");
+	std::ofstream out(path, std::ios::app);
+	out << line << '\n';
+	out.flush();
+}
 
 void DumpInitialPointsToPointTable(void *submesh, const std::string &path)
 {
@@ -2094,15 +2103,15 @@ StreamBoundaryHeaderStats WritePartitionBoundaryAndHeaderFromStreams(
 	const double build_tet_face_shards_t0 = MPI_Wtime();
 	const std::vector<std::string> tet_face_shards = build_tet_face_shard_files(work_dir);
 	stats.time_build_face2vol += MPI_Wtime() - build_tet_face_shards_t0;
-	PrintStreamStageMem("after BuildTetFaceShardFiles");
+	PrintStreamStageMem("after BuildTetFaceShardFiles", output_path);
 
 	const double build_surface_shards_t0 = MPI_Wtime();
 	const std::vector<std::string> surface_shards = build_surface_shard_files(work_dir);
 	stats.time_scan_surface += MPI_Wtime() - build_surface_shards_t0;
-	PrintStreamStageMem("after BuildBoundarySurfaceShardFiles");
+	PrintStreamStageMem("after BuildBoundarySurfaceShardFiles", output_path);
 
 	const int number = write_boundary_from_shards(tet_face_shards, surface_shards, boundary_path);
-	PrintStreamStageMem("after shard boundary join");
+	PrintStreamStageMem("after shard boundary join", output_path);
 
 	if (!keep_shard_files)
 	{
@@ -2285,7 +2294,8 @@ static void LookupVolAdjPointXYZ(const StreamVolWithAdjData &data,
 
 StreamFullMeshQualityStats ComputeFullMeshQualityFromVolWithAdjStreams(
 	const StreamVolWithAdjData &data,
-	const int *newid)
+	const int *newid,
+	const std::string &output_path)
 {
 	if (data.smv == nullptr)
 	{
@@ -2305,7 +2315,10 @@ StreamFullMeshQualityStats ComputeFullMeshQualityFromVolWithAdjStreams(
 
 	int rank = 0;
 	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-	std::cout << "[STREAM] meshQuality surface pass begin rank=" << rank << "\n" << std::flush;
+	AppendRankTestoutLine(
+		output_path,
+		rank,
+		"[STREAM] meshQuality surface pass begin rank=" + std::to_string(rank));
 	std::ifstream surface_input(smv.surface_file_path, std::ios::binary);
 	if (!surface_input)
 	{
@@ -2390,7 +2403,10 @@ StreamFullMeshQualityStats ComputeFullMeshQualityFromVolWithAdjStreams(
 		stats.volume_sum += volume;
 	};
 
-	std::cout << "[STREAM] meshQuality volume pass begin rank=" << rank << "\n" << std::flush;
+	AppendRankTestoutLine(
+		output_path,
+		rank,
+		"[STREAM] meshQuality volume pass begin rank=" + std::to_string(rank));
 	std::ifstream tet_input(smv.tet_file_path, std::ios::binary);
 	if (!tet_input)
 	{
@@ -2690,7 +2706,10 @@ void WriteVolWithAdjFromStreams(const std::string &output_path,
 	const int nse = StreamMesh_GetNSE(smv);
 	int rank = 0;
 	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-	std::cout << "[STREAM] volwithadj writer begin rank=" << rank << "\n" << std::flush;
+	AppendRankTestoutLine(
+		output_path,
+		rank,
+		"[STREAM] volwithadj writer begin rank=" + std::to_string(rank));
 	const std::filesystem::path out_path =
 		std::filesystem::path(output_path) / "volwithadj" / ("volwithadj" + std::to_string(id) + ".vol");
 	EnsureParentDirectory(out_path.string());
@@ -3629,6 +3648,34 @@ void DumpFacesToFileAndClear(std::list<xdFace> &newfaces, const std::string &fil
 	std::list<xdFace>().swap(newfaces);
 }
 
+void DumpNewFacesToSurfaceStream(
+	const std::list<xdFace> &newfaces,
+	const std::string &filepath)
+{
+	EnsureParentDirectory(filepath);
+
+	std::ofstream output(filepath, std::ios::binary | std::ios::trunc);
+	if (!output)
+	{
+		FailStreamOperation("failed to open initial surface stream file from newfaces: " + filepath);
+	}
+
+	std::vector<FaceRecord> buffer;
+	buffer.reserve(kDefaultStreamBatch);
+
+	for (const xdFace &face : newfaces)
+	{
+		FaceRecord record = ToFaceRecord(face);
+		buffer.push_back(record);
+		if (buffer.size() >= kDefaultStreamBatch)
+		{
+			FlushFaceBuffer(output, buffer);
+		}
+	}
+
+	FlushFaceBuffer(output, buffer);
+}
+
 void RefineOneLevelToFile(void *submesh,
 	const std::string &infile,
 	const std::string &outfile,
@@ -3697,7 +3744,24 @@ void Refine_Stream(void *submesh,
 		current_file = next_file;
 	}
 
-	AddFacesFromFileToMesh(submesh, current_file, batch_faces);
+	newfaces.clear();
+	std::ifstream input(current_file, std::ios::binary);
+	if (!input)
+	{
+		FailStreamOperation("failed to open face stream input file: " + current_file);
+	}
+	std::vector<FaceRecord> buffer;
+	while (ReadFaceBatch(input, buffer, batch_faces) > 0)
+	{
+		for (const FaceRecord &record : buffer)
+		{
+			const xdFace face = FromFaceRecord(record);
+			newfaces.push_back(face);
+			int lsvrtx[3] = {face.lsvrtx[0], face.lsvrtx[1], face.lsvrtx[2]};
+			nglib::Ng_AddSurfaceElementwithIndex((nglib::Ng_Mesh *)submesh, nglib::NG_TRIG, lsvrtx, face.geoboundary);
+		}
+	}
+
 	if (!keep_stream_files)
 	{
 		std::filesystem::remove(current_file);
@@ -3815,7 +3879,12 @@ void BarycMidPoint(Barycentric p1, Barycentric p2, Barycentric &res)
 	res.newgid = 0;
 }
 
-void DumpCurrentSurfaceElementsToFile(void *submesh, const std::string &filepath, const std::map<Barycentric, int, CompBarycentric> &baryc2locvrtxmap, const std::map<int, Barycentric> &locvrtx2barycmap)
+void DumpCurrentSurfaceElementsToFile(
+	void *submesh,
+	const std::string &filepath,
+	const std::map<Barycentric, int, CompBarycentric> &baryc2locvrtxmap,
+	const std::map<int, Barycentric> &locvrtx2barycmap,
+	const std::set<FaceKey> *saved_patbound_faces)
 {
 	// 从“当前 submesh 的真实 surface elements”反向重建 surface stream。
 	//
@@ -3843,7 +3912,11 @@ void DumpCurrentSurfaceElementsToFile(void *submesh, const std::string &filepath
 
 		xdFace face{};
 		face.outw = 0;
-		face.patbound = nglib::ispatbound(mesh, i + 1) ? 1 : 0;
+		const FaceKey fk = make_face_key(surfpoints[0], surfpoints[1], surfpoints[2]);
+		if (saved_patbound_faces)
+			face.patbound = saved_patbound_faces->count(fk) ? 1 : 0;
+		else
+			face.patbound = 0;
 		face.geoboundary = surfidx;
 		for (int k = 0; k < 3; ++k)
 		{
@@ -3905,6 +3978,7 @@ void Refineforvol_Stream(void *submesh,
 	const std::string &surface_outfile,
 	const std::string &tet_outfile,
 	const std::string &point_table_path,
+	const std::string &output_path,
 	std::size_t batch_faces,
 	std::size_t batch_tets,
 	int &next_point_id,
@@ -3934,7 +4008,7 @@ void Refineforvol_Stream(void *submesh,
 	std::size_t total_unique_internal_edges = 0;
 
 	// 阶段1：surface refine 保持原样
-	PrintInnerMemLog("enter", round, submesh, baryc2locvrtxmap, locvrtx2barycmap, edgemap);
+	PrintInnerMemLog("enter", round, output_path, submesh, baryc2locvrtxmap, locvrtx2barycmap, edgemap);
 	edgemap.clear();
 
 	std::set<IntPair, IntPairCompare> boundary_edges;
@@ -3950,7 +4024,7 @@ void Refineforvol_Stream(void *submesh,
 		next_point_id,
 		false);
 	const std::size_t boundary_edges_size = boundary_edges.size();
-	PrintInnerMemLog("after_surface", round, submesh, baryc2locvrtxmap, locvrtx2barycmap, edgemap, &boundary_edges_size, nullptr);
+	PrintInnerMemLog("after_surface", round, output_path, submesh, baryc2locvrtxmap, locvrtx2barycmap, edgemap, &boundary_edges_size, nullptr);
 
 	// 阶段2：按 shard 收集内部边请求
 	const std::vector<std::string> edge_req_files = BuildInteriorEdgeShardFiles(
@@ -3960,7 +4034,7 @@ void Refineforvol_Stream(void *submesh,
 		batch_tets,
 		round,
 		shard_count);
-	PrintInnerMemLog("after_edge_req_shards", round, submesh, baryc2locvrtxmap, locvrtx2barycmap, edgemap, nullptr, nullptr, &total_unique_internal_edges);
+	PrintInnerMemLog("after_edge_req_shards", round, output_path, submesh, baryc2locvrtxmap, locvrtx2barycmap, edgemap, nullptr, nullptr, &total_unique_internal_edges);
 
 	// 阶段3：逐 shard 去重并创建内部边中点
 	const std::vector<std::string> edge_mid_files = BuildEdgeShardFilePaths(tet_outfile, "edge_mid", round, shard_count);
@@ -3971,7 +4045,7 @@ void Refineforvol_Stream(void *submesh,
 		batch_tets,
 		next_point_id,
 		total_unique_internal_edges);
-	PrintInnerMemLog("after_edge_mid_shards", round, submesh, baryc2locvrtxmap, locvrtx2barycmap, edgemap, nullptr, nullptr, &total_unique_internal_edges);
+	PrintInnerMemLog("after_edge_mid_shards", round, output_path, submesh, baryc2locvrtxmap, locvrtx2barycmap, edgemap, nullptr, nullptr, &total_unique_internal_edges);
 
 	// 阶段4：第二遍读取 tet_infile，输出 refined tets
 	std::ifstream input(tet_infile, std::ios::binary);
@@ -4054,12 +4128,12 @@ void Refineforvol_Stream(void *submesh,
 		if (IsPowerOfTwo(batch_count))
 		{
 			const std::size_t output_buffer_size = output_buffer.size();
-			PrintInnerMemLog("tet_loop", round, submesh, baryc2locvrtxmap, locvrtx2barycmap, edgemap, nullptr, &output_buffer_size);
+			PrintInnerMemLog("tet_loop", round, output_path, submesh, baryc2locvrtxmap, locvrtx2barycmap, edgemap, nullptr, &output_buffer_size);
 		}
 	}
 
 	FlushTetBuffer(output, output_buffer);
-	PrintInnerMemLog("exit", round, submesh, baryc2locvrtxmap, locvrtx2barycmap, edgemap);
+	PrintInnerMemLog("exit", round, output_path, submesh, baryc2locvrtxmap, locvrtx2barycmap, edgemap);
 
 	for (const std::string &filepath : edge_req_files)
 	{

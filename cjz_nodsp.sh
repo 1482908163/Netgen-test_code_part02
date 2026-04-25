@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=Mesh_part
-#SBATCH --output=/vol8/home/hnu_lhz/cjz/NETGEN/test_code_part02/err/Mesh_part_r3_file_only03.1%j.out
-#SBATCH --error=/vol8/home/hnu_lhz/cjz/NETGEN/test_code_part02/err/Mesh_part_r3_file_only03.1%j.err
+#SBATCH --output=/vol8/home/hnu_lhz/cjz/NETGEN/test_code_part02/err/Mesh_part_r34_c128%j.out
+#SBATCH --error=/vol8/home/hnu_lhz/cjz/NETGEN/test_code_part02/err/Mesh_part_r34_c128%j.err
 #SBATCH -p mt_module
-#SBATCH --nodes=2
-#SBATCH --ntasks=2
+#SBATCH --nodes=128
+#SBATCH --ntasks=128
 #SBATCH --cpus-per-task=1
 
 set -euo pipefail
@@ -14,12 +14,12 @@ PROJ_DIR=/vol8/home/hnu_lhz/cjz/NETGEN/test_code_part02
 BIN_PATH=$PROJ_DIR/build/mesh_occ_mpi/mesh_occ_mpi
 INPUT_PATH=$PROJ_DIR/inputData/wholewall3solid.STEP
 
-OUTPUT_PATH=$PROJ_DIR/result/part_r3_file_only03.1/
+OUTPUT_PATH=$PROJ_DIR/result/part_r34_c128/
 ERR_DIR=$PROJ_DIR/err
 LOCAL_LIB=/vol8/home/hnu_lhz/cjz/lib/usr/lib/aarch64-linux-gnu
 
-numlevels=2
-numrefine=3
+numlevels=3
+numrefine=4
 maxh=1000.0
 minh=0.0
 

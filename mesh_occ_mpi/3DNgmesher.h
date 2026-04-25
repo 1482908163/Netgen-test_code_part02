@@ -16,6 +16,9 @@ void ExtractPartitionSurfaceMesh(void *mesh, idx_t *edest, std::map< int, xdMesh
 void Allgather_Face_Map(std::map<int, xdMeshFaceInfo> &facemap, fid_xdMeshFaceInfo *sub_face_map, int ne, int sub_ne, int *every_sub_ne, int *every_offset);
 void PartFaceCreate(void *mesh, int belongNumberPartition, std::map< int, xdMeshFaceInfo > &facemap, int maxbarycoord, void *submesh, std::map< int, int > &g2lvrtxmap, std::map< Barycentric, int, CompBarycentric > &baryc2locvrtxmap, std::map<int, Barycentric> &locvrtx2barycmap, std::list<xdFace> &newfaces);
 void DumpFacesToFileAndClear(std::list<xdFace> &newfaces, const std::string &filepath);
+void DumpNewFacesToSurfaceStream(
+    const std::list<xdFace> &newfaces,
+    const std::string &filepath);
 
 struct StreamMeshView {
     std::string point_table_path;
@@ -145,6 +148,9 @@ int StreamMesh_GetNE(const StreamMeshView &view);
 void StreamMesh_GetPoint(const StreamMeshView &view, int pid, double xyz[3]);
 void StreamMesh_GetSurfaceElement(const StreamMeshView &view, int sid, int tri[3], int &surfidx);
 void StreamMesh_GetVolumeElement(const StreamMeshView &view, int eid, int tet[4], int &domidx);
+void AppendRankTestoutLine(const std::string &output_path,
+    int rank,
+    const std::string &line);
 void DumpAdjBarycsSummary(const std::string &filepath,
     int mypid,
     const std::map<Barycvrtx, std::list<int>, CompBarycvrtx> &barycvrtx2adjprocsmap);
@@ -185,7 +191,8 @@ void WriteMeshQualityFromStreams(const std::string &output_path,
     const StreamMeshQualityStats &stats);
 StreamFullMeshQualityStats ComputeFullMeshQualityFromVolWithAdjStreams(
     const StreamVolWithAdjData &data,
-    const int *newid);
+    const int *newid,
+    const std::string &output_path);
 void WriteFullMeshQualityFromVolWithAdjStreams(
     const std::string &output_path,
     int id,
@@ -211,12 +218,17 @@ void Refine_Stream(void *submesh, int numlevels, int belongNumberPartition, cons
 void Refine(void *submesh, int numlevels, int belongNumberPartition, std::list<xdFace> &newfaces, std::map<Barycentric, int, CompBarycentric> &baryc2locvrtxmap, std::map<int, Barycentric> &locvrtx2barycmap, std::map<IntPair, int, IntPairCompare> &edgemap);
 void BarycMidPoint(Barycentric p1, Barycentric p2, Barycentric &res);
 Barycentric InitBarycv(int v, int maxbarycoord);
-void DumpCurrentSurfaceElementsToFile(void *submesh, const std::string &filepath, const std::map<Barycentric, int, CompBarycentric> &baryc2locvrtxmap, const std::map<int, Barycentric> &locvrtx2barycmap);
+void DumpCurrentSurfaceElementsToFile(
+    void *submesh,
+    const std::string &filepath,
+    const std::map<Barycentric, int, CompBarycentric> &baryc2locvrtxmap,
+    const std::map<int, Barycentric> &locvrtx2barycmap,
+    const std::set<FaceKey> *saved_patbound_faces = nullptr);
 void DumpCurrentVolumeElementsToFile(void *submesh, const std::string &filepath);
 void DumpInitialPointsToPointTable(void *submesh, const std::string &path);
 void ReplayNewPointsFromPointTableToMesh(void *submesh, const std::string &point_table_path, int start_point_id);
 bool WriteVolFromStreams(const std::string &point_table_path, const std::string &surface_file, const std::string &tet_file, const std::string &out_vol_path);
-void Refineforvol_Stream(void *submesh, const std::string &surface_infile, const std::string &tet_infile, const std::string &surface_outfile, const std::string &tet_outfile, const std::string &point_table_path, std::size_t batch_faces, std::size_t batch_tets, int &next_point_id, std::size_t edge_shards, int round, std::map< Barycentric, int, CompBarycentric > &baryc2locvrtxmap, std::map<int, Barycentric> &locvrtx2barycmap, std::map < IntPair, int, IntPairCompare> &edgemap);
+void Refineforvol_Stream(void *submesh, const std::string &surface_infile, const std::string &tet_infile, const std::string &surface_outfile, const std::string &tet_outfile, const std::string &point_table_path, const std::string &output_path, std::size_t batch_faces, std::size_t batch_tets, int &next_point_id, std::size_t edge_shards, int round, std::map< Barycentric, int, CompBarycentric > &baryc2locvrtxmap, std::map<int, Barycentric> &locvrtx2barycmap, std::map < IntPair, int, IntPairCompare> &edgemap);
 void *ReplayTetsFromFileToMesh(void *submesh, const std::string &filepath, std::size_t batch_tets);
 void Refineforvol(void *submesh, int belongNumberPartition, std::list<xdFace> &newfaces, std::map< Barycentric, int, CompBarycentric > &baryc2locvrtxmap, std::map<int, Barycentric> &locvrtx2barycmap, std::map < IntPair, int, IntPairCompare> &edgemap);
 void computeadj(int mypid, std::map< int, xdMeshFaceInfo > &facemap, std::map<int, int > &g2lvrtxmap, std::map< Barycvrtx, std::list<int>, CompBarycvrtx > &barycvrtx2adjprocsmap);

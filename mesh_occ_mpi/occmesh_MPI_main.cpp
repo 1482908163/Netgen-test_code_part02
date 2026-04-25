@@ -54,38 +54,34 @@ static double get_peak_rss_mb()
     return ru.ru_maxrss / 1024.0;
 }
 
-static void print_stage_mem(const char *tag, int id)
+static void print_stage_mem_to_testout(const char *tag,
+                                       int id,
+                                       const std::string &output_path)
 {
-    double local_current = get_current_rss_mb();
-    double local_peak = get_peak_rss_mb();
-    double global_current = 0.0;
-    double global_peak = 0.0;
-    MPI_Reduce(&local_current, &global_current, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&local_peak, &global_peak, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    if (id == 0)
-        std::cout << "[MEM] " << tag << " : current=" << global_current
-                  << " MB, peak=" << global_peak << " MB" << std::endl;
+    const double current = get_current_rss_mb();
+    const double peak = get_peak_rss_mb();
+    std::ostringstream oss;
+    oss << "[MEM] " << tag
+        << " : current=" << current
+        << " MB, peak=" << peak
+        << " MB";
+    AppendRankTestoutLine(output_path, id, oss.str());
 }
 
-static void print_stage_mem_time(const char *tag, int id, double stage_seconds)
+static void print_stage_mem_time_to_testout(const char *tag,
+                                            int id,
+                                            const std::string &output_path,
+                                            double stage_seconds)
 {
-    double local_current = get_current_rss_mb();
-    double local_peak = get_peak_rss_mb();
-    double global_current = 0.0;
-    double global_peak = 0.0;
-    double global_stage_seconds = 0.0;
-
-    MPI_Reduce(&local_current, &global_current, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&local_peak, &global_peak, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&stage_seconds, &global_stage_seconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-
-    if (id == 0) {
-        std::cout << "[STAGE] " << tag
-                  << " : time=" << global_stage_seconds
-                  << " s, current=" << global_current
-                  << " MB, peak=" << global_peak
-                  << " MB" << std::endl;
-    }
+    const double current = get_current_rss_mb();
+    const double peak = get_peak_rss_mb();
+    std::ostringstream oss;
+    oss << "[STAGE] " << tag
+        << " : time=" << stage_seconds
+        << " s, current=" << current
+        << " MB, peak=" << peak
+        << " MB";
+    AppendRankTestoutLine(output_path, id, oss.str());
 }
 
 //打印帮助信息
@@ -505,7 +501,7 @@ int main(int argc, char **argv) {
         //MPI_Barrier(MPI_COMM_WORLD);
         double currtime2 = MPI_Wtime();
         time[2] = double(currtime2 - currtime1);
-        print_stage_mem("after PartFaceCreate", id);
+        print_stage_mem_to_testout("after PartFaceCreate", id, OUTPUT_PATH);
 
 	        bool skip_final_mesh_postprocess = false;
 	        if(!stream_mode) {
@@ -517,7 +513,7 @@ int main(int argc, char **argv) {
         //MPI_Barrier(MPI_COMM_WORLD);
         double currtime3 = MPI_Wtime();
         time[3] = double(currtime3 - currtime2);
-        print_stage_mem("after Refine_or_Stream", id);
+        print_stage_mem_to_testout("after Refine_or_Stream", id, OUTPUT_PATH);
 
         savepvname = OUTPUT_PATH + "refinedSurfmesh/refinedSurfmesh" + str_id + ".vol";
         if(save_vol) {
@@ -537,7 +533,7 @@ int main(int argc, char **argv) {
         if(id == 0) printf("meshing done \n");
         double currtime4 = MPI_Wtime();
         time[4] = double(currtime4 - currtime3);
-        print_stage_mem("after Ng_GenerateVolumeMesh", id);
+        print_stage_mem_to_testout("after Ng_GenerateVolumeMesh", id, OUTPUT_PATH);
 
         if(!stream_mode) {
             // 原版非流式路径：surface refine 后保留 newfaces，
@@ -559,18 +555,20 @@ int main(int argc, char **argv) {
 	            std::string surface_out = stream_dir + "/surf_rank" + str_id + "_round1.bin";
 	            std::string tet_out = stream_dir + "/tet_rank" + str_id + "_round1.bin";
 	            std::string point_table_path = stream_dir + "/points_rank" + str_id + ".bin";
-	            DumpCurrentSurfaceElementsToFile(submesh, surface_in, baryc2locvrtxmap, locvrtx2barycmap);
+	            DumpNewFacesToSurfaceStream(newfaces, surface_in);
+	            newfaces.clear();
+	            decltype(newfaces)().swap(newfaces);
 	            DumpInitialPointsToPointTable(submesh, point_table_path);
 	            int initial_np = nglib::Ng_GetNP(submesh);
 	            int next_point_id = initial_np + 1;
 	            DumpCurrentVolumeElementsToFile(submesh, tet_in);
-	            print_stage_mem("after DumpCurrentVolumeElementsToFile", id);
+	            print_stage_mem_to_testout("after DumpCurrentVolumeElementsToFile", id, OUTPUT_PATH);
 	            nglib::ClearSurfaceElements(submesh);
 	            submesh = ClearVolumeElementsOrEquivalent(submesh);
-	            print_stage_mem("after ClearVolumeElements", id);
+	            print_stage_mem_to_testout("after ClearVolumeElements", id, OUTPUT_PATH);
 
 	            for (i = 0; i < numrefine; i++) {
-	                Refineforvol_Stream(submesh, surface_in, tet_in, surface_out, tet_out, point_table_path, stream_batch, stream_vol_batch, next_point_id, 16, i + 1, baryc2locvrtxmap, locvrtx2barycmap, edgemap);
+	                Refineforvol_Stream(submesh, surface_in, tet_in, surface_out, tet_out, point_table_path, OUTPUT_PATH, stream_batch, stream_vol_batch, next_point_id, 16, i + 1, baryc2locvrtxmap, locvrtx2barycmap, edgemap);
 	                if(!keep_stream_files) {
 	                    std::filesystem::remove(surface_in);
 	                    std::filesystem::remove(tet_in);
@@ -579,10 +577,10 @@ int main(int argc, char **argv) {
                 std::swap(tet_in, tet_out);
                 surface_out = stream_dir + "/surf_rank" + str_id + "_round" + std::to_string(i + 2) + ".bin";
                 tet_out = stream_dir + "/tet_rank" + str_id + "_round" + std::to_string(i + 2) + ".bin";
-                print_stage_mem("after one Refineforvol_Stream round", id);
+                print_stage_mem_to_testout("after one Refineforvol_Stream round", id, OUTPUT_PATH);
 	            }
 
-		            print_stage_mem("before final replay/postprocess", id);
+		            print_stage_mem_to_testout("before final replay/postprocess", id, OUTPUT_PATH);
 		            if(stream_final_mode == "file_only") {
 		                StreamMeshView smv;
 		                InitStreamMeshView(smv, point_table_path, surface_in, tet_in);
@@ -627,14 +625,17 @@ int main(int argc, char **argv) {
 		                    MPI_Barrier(MPI_COMM_WORLD);
 		                }
 		                const auto finish_timed_stage = [&](const char *tag, double t0) {
-		                    print_stage_mem_time(tag, id, MPI_Wtime() - t0);
+		                    print_stage_mem_time_to_testout(tag, id, OUTPUT_PATH, MPI_Wtime() - t0);
 		                };
 		                std::map<Barycvrtx, std::list<int>, CompBarycvrtx> barycvrtx2adjprocsmap_stream;
 		                double stage_t0 = MPI_Wtime();
 		                computeadj(id, facemap, g2lvrtxmap, barycvrtx2adjprocsmap_stream);
 		                finish_timed_stage("computeadj(file_only)", stage_t0);
 		                if(barycvrtx2adjprocsmap_stream.empty()) {
-		                    std::cout << "[STREAM-WARN] computeadj produced empty adjacency map on rank " << id << std::endl;
+		                    AppendRankTestoutLine(
+		                        OUTPUT_PATH,
+		                        id,
+		                        "[STREAM-WARN] computeadj produced empty adjacency map on rank " + std::to_string(id));
 		                }
 		                int *VEgid = nullptr;
 		                MYCALLOC(VEgid, int *, (stream_ne + 1), sizeof(int));
@@ -716,11 +717,12 @@ int main(int argc, char **argv) {
 		                    newid,
 		                    adjbarycs_stream);
 		                finish_timed_stage("WritePartitionSharedFromAdjBarycs", stage_t0);
-		                if(id == 0) {
-		                    std::cout << "[PARTITION] np=" << stream_np
-		                              << ", ne=" << stream_ne
-		                              << ", adjbarycs.size()=" << adjbarycs_stream.size()
-		                              << std::endl;
+		                {
+		                    std::ostringstream oss;
+		                    oss << "[PARTITION] np=" << stream_np
+		                        << ", ne=" << stream_ne
+		                        << ", adjbarycs.size()=" << adjbarycs_stream.size();
+		                    AppendRankTestoutLine(OUTPUT_PATH, id, oss.str());
 		                }
 		                if(stream_debug_dumps) {
 		                    for(int writer_rank = 0; writer_rank < p; ++writer_rank) {
@@ -758,16 +760,17 @@ int main(int argc, char **argv) {
 		                        adjbarycs_stream,
 		                        stream_debug_dumps);
 		                finish_timed_stage("WritePartitionBoundaryAndHeaderFromStreams", stage_t0);
-		                if (id == 0) {
-		                    std::cout << "[BOUNDARY] "
-		                              << "build_face2vol=" << bh_stats.time_build_face2vol << " s, "
-		                              << "scan_surface=" << bh_stats.time_scan_surface << " s, "
-		                              << "write_header=" << bh_stats.time_write_header << " s, "
-		                              << "face2vol_size=" << bh_stats.face2vol_size << ", "
-		                              << "skipped_patbound=" << bh_stats.skipped_patbound << ", "
-		                              << "matched=" << bh_stats.matched_surface_faces << ", "
-		                              << "missed=" << bh_stats.missed_surface_faces
-		                              << std::endl;
+		                {
+		                    std::ostringstream oss;
+		                    oss << "[BOUNDARY] "
+		                        << "build_face2vol=" << bh_stats.time_build_face2vol << " s, "
+		                        << "scan_surface=" << bh_stats.time_scan_surface << " s, "
+		                        << "write_header=" << bh_stats.time_write_header << " s, "
+		                        << "face2vol_size=" << bh_stats.face2vol_size << ", "
+		                        << "skipped_patbound=" << bh_stats.skipped_patbound << ", "
+		                        << "matched=" << bh_stats.matched_surface_faces << ", "
+		                        << "missed=" << bh_stats.missed_surface_faces;
+		                    AppendRankTestoutLine(OUTPUT_PATH, id, oss.str());
 		                }
 		                StreamVolWithAdjData voladj_data;
 		                stage_t0 = MPI_Wtime();
@@ -783,7 +786,7 @@ int main(int argc, char **argv) {
 		                finish_timed_stage("com_baryVolumeElements_from_streams", stage_t0);
 		                stage_t0 = MPI_Wtime();
 		                const StreamFullMeshQualityStats mq_stats =
-		                    ComputeFullMeshQualityFromVolWithAdjStreams(voladj_data, newid);
+		                    ComputeFullMeshQualityFromVolWithAdjStreams(voladj_data, newid, OUTPUT_PATH);
 		                finish_timed_stage("ComputeFullMeshQualityFromVolWithAdjStreams", stage_t0);
 		                stage_t0 = MPI_Wtime();
 		                WriteFullMeshQualityFromVolWithAdjStreams(
@@ -930,16 +933,14 @@ int main(int argc, char **argv) {
 		                        MPI_Barrier(MPI_COMM_WORLD);
 		                    }
 		                }
-		                if(id == 0) {
-		                    std::cout << "[STREAM] computeadj in file_only mode finished" << std::endl;
-		                    std::cout << "[STREAM] com_barycoords_from_streams finished" << std::endl;
-		                    std::cout << "[STREAM] partition nodes/elements written from streams" << std::endl;
-		                    std::cout << "[STREAM] partition shared written from streams" << std::endl;
-		                    std::cout << "[STREAM] partition boundary/header written from streams" << std::endl;
-		                    std::cout << "[STREAM] meshQuality written from streams" << std::endl;
-		                    std::cout << "[STREAM] volwithadj written from streams" << std::endl;
-		                    std::cout << "[STREAM] final mode=file_only, skip replay/postprocess" << std::endl;
-		                }
+		                AppendRankTestoutLine(OUTPUT_PATH, id, "[STREAM] computeadj in file_only mode finished");
+		                AppendRankTestoutLine(OUTPUT_PATH, id, "[STREAM] com_barycoords_from_streams finished");
+		                AppendRankTestoutLine(OUTPUT_PATH, id, "[STREAM] partition nodes/elements written from streams");
+		                AppendRankTestoutLine(OUTPUT_PATH, id, "[STREAM] partition shared written from streams");
+		                AppendRankTestoutLine(OUTPUT_PATH, id, "[STREAM] partition boundary/header written from streams");
+		                AppendRankTestoutLine(OUTPUT_PATH, id, "[STREAM] meshQuality written from streams");
+		                AppendRankTestoutLine(OUTPUT_PATH, id, "[STREAM] volwithadj written from streams");
+		                AppendRankTestoutLine(OUTPUT_PATH, id, "[STREAM] final mode=file_only, skip replay/postprocess");
 		                if(save_vol) {
 		                    const std::string stream_vol_path = OUTPUT_PATH + "volfined/volfined" + str_id + ".vol";
 		                    if(!WriteVolFromStreams(point_table_path, surface_in, tet_in, stream_vol_path)) {
@@ -950,7 +951,7 @@ int main(int argc, char **argv) {
 		                }
 		                free(newid);
 		                free(VEgid);
-		                print_stage_mem("after final replay/postprocess", id);
+		                print_stage_mem_to_testout("after final replay/postprocess", id, OUTPUT_PATH);
 		                skip_final_mesh_postprocess = true;
 		            }
 		            else {
@@ -959,8 +960,8 @@ int main(int argc, char **argv) {
 		                ReplayNewPointsFromPointTableToMesh(submesh, point_table_path, initial_np + 1);
 		                AddFacesFromFileToMesh(submesh, surface_in, stream_batch);
 		                submesh = (Ng_Mesh *)ReplayTetsFromFileToMesh(submesh, tet_in, stream_vol_batch);
-		                print_stage_mem("after ReplayTetsFromFileToMesh", id);
-		                print_stage_mem("after final replay/postprocess", id);
+		                print_stage_mem_to_testout("after ReplayTetsFromFileToMesh", id, OUTPUT_PATH);
+		                print_stage_mem_to_testout("after final replay/postprocess", id, OUTPUT_PATH);
 
 		                if(!keep_stream_files) {
 		                    std::filesystem::remove(surface_in);
